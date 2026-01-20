@@ -371,23 +371,26 @@ class TitansMemoryModule(nn.Module):
         )
 
         # Contains current state of the memory module parameters and their momentums.
-        # Initialized during first update call.
+        # Re-initialized at every forward pass if cache is None.
         self.params_dict = None
+
+    def reset_params(self, batch_size: int) -> None:
+        """
+        Resets the memory module parameters to initial states.
+        """
+        weight_shape = (batch_size, *self.W1.shape)
+        self.params_dict = {
+            "W1": self.W1.unsqueeze(0).expand(weight_shape),
+            "W2": self.W2.unsqueeze(0).expand(weight_shape),
+            "W1_surprise": torch.zeros(weight_shape, device=self.W1.device, dtype=self.W1.dtype),
+            "W2_surprise": torch.zeros(weight_shape, device=self.W2.device, dtype=self.W2.dtype),
+        }
 
     def retrieve(self, query_states: torch.Tensor) -> torch.Tensor:
         """
         Retrieves information from the memory module.
         """
         batch_size, num_heads, seq_len, head_dim = query_states.shape
-        # Initialize params dict on first retrieve call.
-        if self.params_dict is None:
-            batch_param_shape = (query_states.size(0), -1, -1, -1)
-            self.params_dict = {
-                "W1": self.W1.unsqueeze(0).expand(batch_param_shape),
-                "W2": self.W2.unsqueeze(0).expand(batch_param_shape),
-                "W1_surprise": torch.zeros_like(self.W1).unsqueeze(0).expand(batch_param_shape),
-                "W2_surprise": torch.zeros_like(self.W2).unsqueeze(0).expand(batch_param_shape),
-            }
         W1 = self.params_dict["W1"]
         W2 = self.params_dict["W2"]
 
@@ -570,6 +573,13 @@ class TitansModel(TitansPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def reset_params(self, batch_size: int) -> None:
+        """
+        Resets the memory module parameters for all layers.
+        """
+        for layer in self.layers:
+            layer.memory.reset_params(batch_size)
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -590,6 +600,10 @@ class TitansModel(TitansPreTrainedModel):
         if use_cache and cache is None:
             # TODO(TG): Implement cache later.
             use_cache = False
+
+        if not use_cache and cache is None:
+            # Reset memory module params if no cache is provided.
+            self.reset_params(batch_size=inputs_embeds.size(0))
 
         hidden_states = inputs_embeds
 
