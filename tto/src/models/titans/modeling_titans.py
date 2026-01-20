@@ -35,7 +35,10 @@ except ImportError:
         "You can install it via `pip install accelerated_scan`."
     )
 
-from .configuration_titans import TitansConfig
+try:
+    from .configuration_titans import TitansConfig
+except ImportError:
+    from configuration_titans import TitansConfig
 
 logger = logging.get_logger(__name__)
 
@@ -196,29 +199,42 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 def parallel_scan(
-    decays: torch.Tensor,
-    values: torch.Tensor,
+    chunk_decays: torch.Tensor,
+    chunk_values: torch.Tensor,
     init_value: torch.Tensor,
 ) -> torch.Tensor:
     """
     Performs an associative scan over the input values with the given decays.
-    Note that recurrence is computed with an initial value belonging to the previous chunk,
-    necessitating supplying that too.
-    """
-    batch_size, num_heads, seq_len, dim1_size, dim2_size = values.shape
-    # The third-party scan implementation does not allow specifying an initial value (default 0),
-    # so we do the first step of the recurrence manually here.
-    init_value = init_value.unsqueeze(2)  # [batch_size, num_heads, 1, dim1_size, dim2_size]
-    decays = decays.expand_as(values)
-    modified_first_term = (decays[:, :, 0:1] * init_value) + values[:, :, 0:1]
-    values_new = torch.cat([modified_first_term, values[:, :, 1:]], dim=2)
 
-    # Merge batch_size with heads and dim sizes for scan.
-    decays = decays.reshape(batch_size * num_heads, seq_len, dim1_size * dim2_size).transpose(-2, -1).contiguous()
-    values_new = values_new.reshape(batch_size * num_heads, seq_len, dim1_size * dim2_size).transpose(-2, -1).contiguous()
-    # Run scan
-    scanned = scan(decays, values_new)
-    return scanned.reshape(batch_size, num_heads, dim1_size, dim2_size, seq_len).permute(0, 1, 4, 2, 3)
+    Uses 4D tensors for memory efficiency (activation-space, not weight-space).
+
+    Args:
+        chunk_decays: [batch, num_heads, seq_len, 1] decay factors per timestep
+        chunk_values: [batch, num_heads, seq_len, dim_size] values to accumulate
+        init_value: [batch, num_heads, 1, dim_size] initial carry value
+
+    Returns:
+        Scanned values [batch, num_heads, seq_len, dim_size]
+    """
+    batch_size, num_heads, seq_len, dim_size = chunk_values.shape
+
+    # Pad decays with 1.0 for the initial position (identity for multiplication)
+    decays = F.pad(chunk_decays, (0, 0, 1, 0), value=1.0)
+
+    # Prepend init_value to values
+    values = torch.cat([init_value, chunk_values], dim=2)
+
+    # Expand decay to match value shape
+    decays = decays.expand(-1, -1, -1, dim_size)
+
+    # Reshape for accelerated-scan which expects 3D tensors [B, C, L]
+    decays = decays.transpose(-2, -1).reshape(batch_size, num_heads * dim_size, seq_len + 1)
+    values = values.transpose(-2, -1).reshape(batch_size, num_heads * dim_size, seq_len + 1)
+
+    # Run scan and chop off the initial padding
+    scanned = scan(decays, values)[:, :, 1:]
+
+    return scanned.view(batch_size, num_heads, dim_size, seq_len).transpose(-2, -1).contiguous()
 
 """
 TODO(TG): Implement TitansCache.
@@ -371,14 +387,25 @@ class TitansMemoryModule(nn.Module):
     def reset_params(self, batch_size: int) -> None:
         """
         Resets the memory module parameters to initial states.
+
+        Uses activation-space momentum (4D tensors) instead of weight-space (5D)
+        for O(L*D) memory scaling instead of O(L*D1*D2).
         """
-        new_W1_shape = (batch_size, *self.W1.shape)
-        new_W2_shape = (batch_size, *self.W2.shape)
+        mem_intermediate_size = int(self.head_dim * self.config.mem_expansion_factor)
         self.params_dict = {
-            "W1": self.W1.unsqueeze(0).expand(*new_W1_shape),
-            "W2": self.W2.unsqueeze(0).expand(*new_W2_shape),
-            "W1_surprise": torch.zeros(new_W1_shape, device=self.W1.device, dtype=self.W1.dtype),
-            "W2_surprise": torch.zeros(new_W2_shape, device=self.W2.device, dtype=self.W2.dtype),
+            # Weights: [B, H, head_dim, intermediate] and [B, H, intermediate, head_dim]
+            "W1": self.W1.unsqueeze(0).expand(batch_size, -1, -1, -1).clone(),
+            "W2": self.W2.unsqueeze(0).expand(batch_size, -1, -1, -1).clone(),
+            # Activation-space momentum: [B, H, 1, D] - NOT weight-space [B, H, D1, D2]
+            "W1_surprise": torch.zeros(batch_size, self.config.num_mem_heads, 1, mem_intermediate_size,
+                                      device=self.W1.device, dtype=self.W1.dtype),
+            "W2_surprise": torch.zeros(batch_size, self.config.num_mem_heads, 1, self.head_dim,
+                                      device=self.W2.device, dtype=self.W2.dtype),
+            # Input-side momentum for outer product weight updates
+            "key_momentum": torch.zeros(batch_size, self.config.num_mem_heads, 1, self.head_dim,
+                                       device=self.W1.device, dtype=self.W1.dtype),
+            "X1_momentum": torch.zeros(batch_size, self.config.num_mem_heads, 1, mem_intermediate_size,
+                                      device=self.W1.device, dtype=self.W1.dtype),
         }
 
     def retrieve(self, query_states: torch.Tensor) -> torch.Tensor:
@@ -399,51 +426,70 @@ class TitansMemoryModule(nn.Module):
     def update(self, hidden_states: torch.Tensor, key_states: torch.Tensor, value_states: torch.Tensor, cache: TitansCache | None = None) -> None:
         """
         Updates the memory module with new information.
+
+        Key optimization: accumulate activation-space gradients via scan (4D tensors),
+        then apply outer products only at chunk boundaries to update weights.
+        This gives O(L*D) memory instead of O(L*D1*D2).
         """
-        # Grab current params.
         W1 = self.params_dict["W1"]
         W2 = self.params_dict["W2"]
         W1_surprise = self.params_dict["W1_surprise"]
         W2_surprise = self.params_dict["W2_surprise"]
+        key_momentum = self.params_dict["key_momentum"]
+        X1_momentum = self.params_dict["X1_momentum"]
 
-        # Get decays (1 - alpha in Titans paper) and LR
-        # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len, 1, 1]
-        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)).transpose(-2, -1)[..., None, None]
-        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states)).transpose(-2, -1)[..., None, None]
-        lr = torch.sigmoid(self.lr_proj(hidden_states)).transpose(-2, -1)[..., None, None]
+        # Get decays and LR from hidden states [B, L, H] -> [B, H, L, 1]
+        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states))
+        mem_decay = mem_decay.transpose(-2, -1).unsqueeze(-1)
+        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states))
+        surprise_decay = surprise_decay.transpose(-2, -1).unsqueeze(-1)
+        lr = torch.sigmoid(self.lr_proj(hidden_states))
+        lr = lr.transpose(-2, -1).unsqueeze(-1)
 
-        # Keys fed through memory module
-        # Pass through memory MLP
-        Z1 = key_states @ W1  # [batch, num_heads, seq_len, mem_intermediate_size]
+        # Forward pass through memory MLP with keys
+        Z1 = key_states @ W1  # [B, H, L, intermediate]
         X1 = F.silu(Z1)
-        mems = X1 @ W2  # [batch, num_heads, seq_len, head_dim]
+        mems = X1 @ W2  # [B, H, L, head_dim]
 
-        # Derivative of L2 loss wrt activations.
-        # TTT is cheeky by just having their loss function be 1/2 * ||mem - V||^2, thus eliminating
-        # 2, but I don't know if Titans paper does this so I'll keep the 2 here for correctness.
-        grad_wrt_mems = 2.0 * (mems - value_states)  # [batch, num_heads, seq_len, head_dim]
-        grad_wrt_Z1 = grad_wrt_mems @ W2.transpose(-2, -1) * silu_backward(Z1)  # [batch, num_heads, seq_len, mem_intermediate_size]
+        # Gradient of L2 loss w.r.t. activations (activation-space, not weight-space)
+        grad_wrt_mems = (mems - value_states)  # [B, H, L, head_dim]
+        grad_wrt_Z1 = (grad_wrt_mems @ W2.transpose(-2, -1)) * silu_backward(Z1)  # [B, H, L, intermediate]
 
-        # Compute gradients for W1 and W2.
-        grad_W2_t = -1.0 * lr * torch.einsum('bhsi,bhsd->bhsid', X1, grad_wrt_mems)
-        grad_W1_t = -1.0 * lr * torch.einsum('bhsd,bhsi->bhsdi', key_states, grad_wrt_Z1)
+        # Scale by learning rate (negative for gradient descent)
+        grad_wrt_mems = -lr * grad_wrt_mems
+        grad_wrt_Z1 = -lr * grad_wrt_Z1
 
-        # TODO(TG): Create fused kernel for surprise/decay scans later.
-        # Calculate new surprises via. associative scans.
-        W1_surprise = parallel_scan(surprise_decay, grad_W1_t, init_value=W1_surprise) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
-        W2_surprise = parallel_scan(surprise_decay, grad_W2_t, init_value=W2_surprise) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
+        # Accumulate activation-space gradients via parallel scan (surprise momentum)
+        # This is O(L*D) instead of O(L*D1*D2)
+        W1_surprise_new = parallel_scan(surprise_decay, grad_wrt_Z1, init_value=W1_surprise)
+        W2_surprise_new = parallel_scan(surprise_decay, grad_wrt_mems, init_value=W2_surprise)
 
-        # Now update memory weights with surprise.
-        # NOTE(TG): I think in the paper they actually incorporate decay into the grad calc, but
-        # I don't quite understand beta_t over beta_i and diagonal matmuls yet, so we're just doing it like this.
-        W1 = parallel_scan(mem_decay, W1_surprise, init_value=W1)
-        W2 = parallel_scan(mem_decay, W2_surprise, init_value=W2)
+        # Also accumulate the "input" side for outer product
+        key_momentum_new = parallel_scan(surprise_decay, key_states, init_value=key_momentum)
+        X1_momentum_new = parallel_scan(surprise_decay, X1, init_value=X1_momentum)
 
-        # Update params dict with new weights and surprises at end of the chunk.
-        self.params_dict["W1"] = W1[:, :, -1]
-        self.params_dict["W2"] = W2[:, :, -1]
-        self.params_dict["W1_surprise"] = W1_surprise[:, :, -1]
-        self.params_dict["W2_surprise"] = W2_surprise[:, :, -1]
+        # Weight update: outer product of accumulated inputs and gradients at chunk end
+        key_accum = key_momentum_new[:, :, -1:, :]   # [B, H, 1, head_dim]
+        X1_accum = X1_momentum_new[:, :, -1:, :]     # [B, H, 1, intermediate]
+        grad_Z1_accum = W1_surprise_new[:, :, -1:, :]   # [B, H, 1, intermediate]
+        grad_mem_accum = W2_surprise_new[:, :, -1:, :]  # [B, H, 1, head_dim]
+
+        # Compute weight deltas via outer products
+        dW1 = key_accum.transpose(-2, -1) @ grad_Z1_accum   # [B, H, head_dim, intermediate]
+        dW2 = X1_accum.transpose(-2, -1) @ grad_mem_accum   # [B, H, intermediate, head_dim]
+
+        # Apply memory decay and update weights
+        avg_mem_decay = mem_decay.mean(dim=2, keepdim=True).squeeze(2)  # [B, H, 1]
+        W1 = avg_mem_decay.unsqueeze(-1) * W1 + dW1
+        W2 = avg_mem_decay.unsqueeze(-1) * W2 + dW2
+
+        # Update params dict
+        self.params_dict["W1"] = W1
+        self.params_dict["W2"] = W2
+        self.params_dict["W1_surprise"] = W1_surprise_new[:, :, -1:, :]
+        self.params_dict["W2_surprise"] = W2_surprise_new[:, :, -1:, :]
+        self.params_dict["key_momentum"] = key_momentum_new[:, :, -1:, :]
+        self.params_dict["X1_momentum"] = X1_momentum_new[:, :, -1:, :]
     
     def forward(
         self,
@@ -455,6 +501,7 @@ class TitansMemoryModule(nn.Module):
         This forward function is only used for the MAL and LMM variants of Titans, with
         the others by necessity having to need self.retrieve and self.update called separately.
         """
+        batch_size, seq_len, hidden_size = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -468,11 +515,15 @@ class TitansMemoryModule(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
         value_states = self.conv_v(value_states, cache=cache)
 
+        # Use separate output buffer to avoid inplace modification of hidden_states
+        # which would break gradient computation during backprop
+        output_chunks = []
+
         # Split hidden states into chunks along the sequence dimension for update processing.
-        num_chunks = (hidden_states.size(1) + self.chunk_size - 1) // self.chunk_size
+        num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * self.chunk_size
-            chunk_end = min((chunk_idx + 1) * self.chunk_size, hidden_states.size(1))
+            chunk_end = min((chunk_idx + 1) * self.chunk_size, seq_len)
 
             chunk_hidden_states = hidden_states[:, chunk_start:chunk_end, :]
             chunk_query_states = query_states[:, :, chunk_start:chunk_end, :]
@@ -481,9 +532,10 @@ class TitansMemoryModule(nn.Module):
 
             retrieved_chunk = self.retrieve(chunk_query_states)
             self.update(chunk_hidden_states, chunk_key_states, chunk_value_states, cache=cache)
-            hidden_states[:, chunk_start:chunk_end, :] = retrieved_chunk
+            output_chunks.append(retrieved_chunk)
 
-        return hidden_states
+        # Concatenate all chunks
+        return torch.cat(output_chunks, dim=1)
 
 class TitansMLP(nn.Module):
     def __init__(self, config):
