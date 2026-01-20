@@ -94,7 +94,7 @@ class TitansConfig(PretrainedConfig):
         self.num_mem_heads = num_mem_heads
         self.num_persistent_mem_tokens = num_persistent_mem_tokens
         self.mem_expansion_factor = mem_expansion_factor
-        
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -102,3 +102,55 @@ class TitansConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+# Preset configurations for different model sizes
+TITANS_CONFIGS = {
+    "titans-tiny": {
+        "hidden_size": 256,
+        "intermediate_size": 1024,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_mem_heads": 4,
+        "chunk_size": 32,
+    },
+    "titans-small": {
+        "hidden_size": 512,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 8,
+        "num_mem_heads": 8,
+        "chunk_size": 64,
+    },
+    "titans-base": {
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12,
+        "num_mem_heads": 12,
+        "chunk_size": 64,
+    },
+    "titans-large": {
+        "hidden_size": 1024,
+        "intermediate_size": 4096,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "num_mem_heads": 16,
+        "chunk_size": 128,
+    },
+}
+
+
+def get_titans_config(name: str) -> TitansConfig:
+    """Get a preset Titans configuration by name.
+
+    Args:
+        name: One of 'titans-tiny', 'titans-small', 'titans-base', 'titans-large'
+
+    Returns:
+        TitansConfig instance with preset parameters
+    """
+    if name not in TITANS_CONFIGS:
+        available = ", ".join(TITANS_CONFIGS.keys())
+        raise ValueError(f"Unknown config name: {name}. Available: {available}")
+    return TitansConfig(**TITANS_CONFIGS[name])

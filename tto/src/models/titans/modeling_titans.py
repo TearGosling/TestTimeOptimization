@@ -35,7 +35,10 @@ except ImportError:
         "You can install it via `pip install accelerated_scan`."
     )
 
-from .configuration_titans import TitansConfig
+try:
+    from .configuration_titans import TitansConfig
+except ImportError:
+    from configuration_titans import TitansConfig
 
 logger = logging.get_logger(__name__)
 
@@ -375,8 +378,9 @@ class TitansMemoryModule(nn.Module):
         new_W1_shape = (batch_size, *self.W1.shape)
         new_W2_shape = (batch_size, *self.W2.shape)
         self.params_dict = {
-            "W1": self.W1.unsqueeze(0).expand(*new_W1_shape),
-            "W2": self.W2.unsqueeze(0).expand(*new_W2_shape),
+            # Use .clone() to avoid shared storage which causes inplace operation errors during backprop
+            "W1": self.W1.unsqueeze(0).expand(*new_W1_shape).clone(),
+            "W2": self.W2.unsqueeze(0).expand(*new_W2_shape).clone(),
             "W1_surprise": torch.zeros(new_W1_shape, device=self.W1.device, dtype=self.W1.dtype),
             "W2_surprise": torch.zeros(new_W2_shape, device=self.W2.device, dtype=self.W2.dtype),
         }
@@ -455,6 +459,7 @@ class TitansMemoryModule(nn.Module):
         This forward function is only used for the MAL and LMM variants of Titans, with
         the others by necessity having to need self.retrieve and self.update called separately.
         """
+        batch_size, seq_len, hidden_size = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -468,11 +473,15 @@ class TitansMemoryModule(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
         value_states = self.conv_v(value_states, cache=cache)
 
+        # Use separate output buffer to avoid inplace modification of hidden_states
+        # which would break gradient computation during backprop
+        output_chunks = []
+
         # Split hidden states into chunks along the sequence dimension for update processing.
-        num_chunks = (hidden_states.size(1) + self.chunk_size - 1) // self.chunk_size
+        num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * self.chunk_size
-            chunk_end = min((chunk_idx + 1) * self.chunk_size, hidden_states.size(1))
+            chunk_end = min((chunk_idx + 1) * self.chunk_size, seq_len)
 
             chunk_hidden_states = hidden_states[:, chunk_start:chunk_end, :]
             chunk_query_states = query_states[:, :, chunk_start:chunk_end, :]
@@ -481,9 +490,10 @@ class TitansMemoryModule(nn.Module):
 
             retrieved_chunk = self.retrieve(chunk_query_states)
             self.update(chunk_hidden_states, chunk_key_states, chunk_value_states, cache=cache)
-            hidden_states[:, chunk_start:chunk_end, :] = retrieved_chunk
+            output_chunks.append(retrieved_chunk)
 
-        return hidden_states
+        # Concatenate all chunks
+        return torch.cat(output_chunks, dim=1)
 
 class TitansMLP(nn.Module):
     def __init__(self, config):
