@@ -58,6 +58,8 @@ class TitansConfig(PretrainedConfig):
         mem_expansion_factor: float = 4.0,
         num_mem_heads: int = 32,
         num_persistent_mem_tokens: int = 4,
+        use_output_proj: bool = True,
+        use_gate: bool = True,
         **kwargs,
     ):
         if variant != "lmm":
@@ -94,7 +96,9 @@ class TitansConfig(PretrainedConfig):
         self.num_mem_heads = num_mem_heads
         self.num_persistent_mem_tokens = num_persistent_mem_tokens
         self.mem_expansion_factor = mem_expansion_factor
-        
+        self.use_output_proj = use_output_proj
+        self.use_gate = use_gate
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

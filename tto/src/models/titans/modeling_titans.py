@@ -39,6 +39,58 @@ from .configuration_titans import TitansConfig
 
 logger = logging.get_logger(__name__)
 
+# TODO(TG): Create utils file later for these common modules.
+def ln_fwd(x, gamma, beta, eps=1e-6):
+    """
+    Batch forward for LayerNorm.
+    """
+    # Mean and variance computation
+    mu = x.mean(dim=-1, keepdim=True)
+    var = x.var(dim=-1, keepdim=True, unbiased=False)
+
+    # Normalization
+    std = torch.sqrt(var + eps)
+    x_hat = (x - mu) / std
+
+    # Scale and shift
+    y = gamma * x_hat + beta
+
+    return y
+
+def ln_fused_l2_bwd(x, pred, gamma, beta, eps=1e-6):
+    """
+    Batch backward for LayerNorm fused with L2 loss.
+    """
+    D = x.shape[-1]
+
+    # Mean and variance computation
+    mu = x.mean(dim=-1, keepdim=True)
+    var = x.var(dim=-1, keepdim=True, unbiased=False)
+
+    # Normalization
+    std = torch.sqrt(var + eps)
+    x_hat = (x - mu) / std
+
+    # Scale and shift
+    y = gamma * x_hat + beta
+
+    # Derivative of L2 loss wrt activations.
+    # TTT is cheeky by just having their loss function be 1/2 * ||mem - V||^2, thus eliminating
+    # 2, but I don't know if Titans authors did this so I'll keep the 2 here for correctness.
+    grad_output = 2.0 * (y - pred)
+    grad_x_hat = grad_output * gamma
+    z = (
+        (1.0 / D)
+        * (
+            D * grad_x_hat
+            - grad_x_hat.sum(dim=-1, keepdim=True)
+            - x_hat * (grad_x_hat * x_hat).sum(dim=-1, keepdim=True)
+        )
+        / std
+    )
+
+    return z
+
 class TitansRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -328,24 +380,46 @@ class TitansMemoryModule(nn.Module):
         self.head_dim = config.hidden_size // config.num_mem_heads
         self.chunk_size = config.chunk_size
 
-        # TODO(TG): No GQA support for memory module for now.
+        # TODO(TG): No GQA support for memory module for now, nor specifying the head_dim manually.
         self.q_proj = nn.Linear(config.hidden_size, config.num_mem_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, config.num_mem_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_mem_heads * self.head_dim, bias=False)
 
         # NOTE(TG): Titans paper states they use L2 normalization for QK, but lucidrains and convention
         # uses RMSnorm. I'm providing the option for either.
-        self.q_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else lambda x: F.normalize(x, p=2.0, dim=-1)
-        self.k_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else lambda x: F.normalize(x, p=2.0, dim=-1)
+        l2_norm = lambda x: F.normalize(x, p=2.0, dim=-1)
+        self.q_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else l2_norm
+        self.k_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else l2_norm
 
         self.conv_q = TitansConv(config, layer_idx, conv_name="mem_q")
         self.conv_k = TitansConv(config, layer_idx, conv_name="mem_k")
         self.conv_v = TitansConv(config, layer_idx, conv_name="mem_v")
 
         # Gate projections to memory decay (alpha), surprise decay (eta) and learning rate (theta)
-        self.mem_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=True)
-        self.surprise_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=True)
-        self.lr_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=True)
+        self.mem_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
+        self.surprise_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
+        self.lr_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
+
+        # Additional details about projections in the Titans memory module layer is a bit confusing
+        # between the paper and implementations. The paper mentions using a GSS (Mehta et al. 2023)
+        # style of gating with additional gate proj and an output proj. TTT uses an output proj but leaves
+        # mamba-style gating as optional. The lucidrains implementation does not use gating
+        # and only optionally includes an output projection. The related papers ATLAS and MIRAS,
+        # built on Titans by the same authors, uses gating but no output projection, only a post-norm
+        # on the memory output (Fig 2. MIRAS, Fig 3. ATLAS). But GSS - the cited arch - doesn't have a post-norm,
+        # it has a shared prenorm on the input! TTT has a post-norm but it's not optional regardless of whether you gate or not!
+        # It is a chaotic fucking mess out there, to put it bluntly. There are many more inconsistencies I haven't even mentioned here.
+        # The paper mentions gating, "normalization" (doesn't specify which), and an output projection.
+        # We will implement all of these as options. By default, I will assume post-norm, gating, and output proj.
+        # These can be turned off in the config separately if desired - it may not be worth the extra param cost.
+        # Sorry for the crashout, code reader!
+        self.use_gate = config.use_gate
+        self.use_output_proj = config.use_output_proj
+        if self.use_output_proj:
+            self.o_proj = nn.Linear(config.num_mem_heads * self.head_dim, config.hidden_size, bias=False)
+        if self.use_gate:
+            self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            self.gate_norm = TitansRMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps) if config.rms_qk_norm else l2_norm
 
         mem_intermediate_size = int(self.head_dim * config.mem_expansion_factor)
         # MLP acting as our memory module.
@@ -363,6 +437,9 @@ class TitansMemoryModule(nn.Module):
                 size=(config.num_mem_heads, mem_intermediate_size, self.head_dim),
             )
         )
+        # LayerNorm for memory output.
+        self.norm_w = nn.Parameter(torch.ones(config.num_mem_heads, self.head_dim))
+        self.norm_b = nn.Parameter(torch.zeros(config.num_mem_heads, self.head_dim))
 
         # Contains current state of the memory module parameters and their momentums.
         # Re-initialized at every forward pass if cache is None.
@@ -381,9 +458,10 @@ class TitansMemoryModule(nn.Module):
             "W2_surprise": torch.zeros(new_W2_shape, device=self.W2.device, dtype=self.W2.dtype),
         }
 
-    def retrieve(self, query_states: torch.Tensor) -> torch.Tensor:
+    def retrieve(self, query_states: torch.Tensor, gate_states: torch.Tensor | None = None) -> torch.Tensor:
         """
         Retrieves information from the memory module.
+        Combines with gating and output projection if specified.
         """
         batch_size, num_heads, seq_len, head_dim = query_states.shape
         W1 = self.params_dict["W1"]
@@ -394,7 +472,15 @@ class TitansMemoryModule(nn.Module):
         mem_states = F.silu(mem_states)
         mem_states = mem_states @ W2  # [batch, num_heads, seq_len, head_dim]
 
-        return mem_states.transpose(-2, -1).reshape(batch_size, seq_len, num_heads * head_dim)
+        out = mem_states.transpose(-2, -1).reshape(batch_size, seq_len, num_heads * head_dim)
+        if self.use_gate and gate_states is not None:
+            # Apply gating and norm
+            out = self.gate_norm(out) * F.silu(gate_states)
+
+        if self.use_output_proj:
+            out = self.o_proj(out)
+
+        return out
     
     def update(self, hidden_states: torch.Tensor, key_states: torch.Tensor, value_states: torch.Tensor, cache: TitansCache | None = None) -> None:
         """
@@ -407,41 +493,46 @@ class TitansMemoryModule(nn.Module):
         W2_surprise = self.params_dict["W2_surprise"]
 
         # Get decays (1 - alpha in Titans paper) and LR
-        # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len, 1, 1]
-        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)).transpose(-2, -1)[..., None, None]
-        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states)).transpose(-2, -1)[..., None, None]
-        lr = torch.sigmoid(self.lr_proj(hidden_states)).transpose(-2, -1)[..., None, None]
+        # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len]
+        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)).transpose(-2, -1)
+        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states)).transpose(-2, -1)[..., None, None] # Extra 2 dims required for parallel scan
+        lr = torch.sigmoid(self.lr_proj(hidden_states)).transpose(-2, -1)
+
+        # Beta calculation as per Titans paper.
+        betas = torch.cumprod(mem_decay, dim=-1)
+        beta_T = betas[:, :, -1:]
+
+        # Avoid division by zero
+        mem_decay_factors = beta_T / (betas + 1e-8)
+        effective_lr = (lr * mem_decay_factors).unsqueeze(-1)
 
         # Keys fed through memory module
         # Pass through memory MLP
         Z1 = key_states @ W1  # [batch, num_heads, seq_len, mem_intermediate_size]
         X1 = F.silu(Z1)
         mems = X1 @ W2  # [batch, num_heads, seq_len, head_dim]
-
-        # Derivative of L2 loss wrt activations.
-        # TTT is cheeky by just having their loss function be 1/2 * ||mem - V||^2, thus eliminating
-        # 2, but I don't know if Titans paper does this so I'll keep the 2 here for correctness.
-        grad_wrt_mems = 2.0 * (mems - value_states)  # [batch, num_heads, seq_len, head_dim]
+        
+        # Norm which gets us to grads wrt activations.
+        ln_weight = self.norm_w.reshape(1, mems.size(1), 1, self.head_dim)
+        ln_bias = self.norm_b.reshape(1, mems.size(1), 1, self.head_dim)
+        grad_wrt_mems = ln_fused_l2_bwd(mems, value_states, ln_weight, ln_bias)
         grad_wrt_Z1 = grad_wrt_mems @ W2.transpose(-2, -1) * silu_backward(Z1)  # [batch, num_heads, seq_len, mem_intermediate_size]
 
         # Compute gradients for W1 and W2.
-        grad_W2_t = -1.0 * lr * torch.einsum('bhsi,bhsd->bhsid', X1, grad_wrt_mems)
-        grad_W1_t = -1.0 * lr * torch.einsum('bhsd,bhsi->bhsdi', key_states, grad_wrt_Z1)
+        grad_W2_t = -1.0 * torch.einsum('bhsi,bhsd,bhsi->bhsid', X1, grad_wrt_mems, effective_lr)
+        grad_W1_t = -1.0 * torch.einsum('bhsd,bhsi,bhsi->bhsdi', key_states, grad_wrt_Z1, effective_lr)
 
-        # TODO(TG): Create fused kernel for surprise/decay scans later.
         # Calculate new surprises via. associative scans.
         W1_surprise = parallel_scan(surprise_decay, grad_W1_t, init_value=W1_surprise) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
         W2_surprise = parallel_scan(surprise_decay, grad_W2_t, init_value=W2_surprise) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
 
-        # Now update memory weights with surprise.
-        # NOTE(TG): I think in the paper they actually incorporate decay into the grad calc, but
-        # I don't quite understand beta_t over beta_i and diagonal matmuls yet, so we're just doing it like this.
-        W1 = parallel_scan(mem_decay, W1_surprise, init_value=W1)
-        W2 = parallel_scan(mem_decay, W2_surprise, init_value=W2)
-
+        # Update weights
+        beta_T = beta_T.unsqueeze(-1)
+        W1 = beta_T * W1 + W1_surprise[:, :, -1]
+        W2 = beta_T * W2 + W2_surprise[:, :, -1]
         # Update params dict with new weights and surprises at end of the chunk.
-        self.params_dict["W1"] = W1[:, :, -1]
-        self.params_dict["W2"] = W2[:, :, -1]
+        self.params_dict["W1"] = W1
+        self.params_dict["W2"] = W2
         self.params_dict["W1_surprise"] = W1_surprise[:, :, -1]
         self.params_dict["W2_surprise"] = W2_surprise[:, :, -1]
     
@@ -513,6 +604,16 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
         self.post_attn_layernorm = None
         self.post_memory_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Persistent memory tokens.
+        self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
+        self.persistent_mem = nn.Parameter(
+            torch.normal(
+                mean=0.0,
+                std=config.initializer_range,
+                size=(1, config.num_persistent_mem_tokens, config.hidden_size),
+            )
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -524,9 +625,15 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+
+        # Concatenate persistent memory tokens
+        persistent_mem = self.persistent_mem.expand(hidden_states.size(0), -1, -1)
+        hidden_states = torch.cat([persistent_mem, hidden_states], dim=1)
         hidden_states = self.input_layernorm(hidden_states)
         # Self-Attention block would go here for non-LMM variants.
         hidden_states = self.memory(hidden_states=hidden_states, cache=cache)
+        # Remove persistent memory tokens
+        hidden_states = hidden_states[:, self.num_persistent_mem_tokens:, :]
         hidden_states = residual + hidden_states
 
         # MLP block
