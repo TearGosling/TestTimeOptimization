@@ -8,7 +8,7 @@ class TitansConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`TitansModel`]. It is used to instantiate a Titans
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of a 1B param model.
+    defaults will yield a similar configuration to that of a 1.5B param model.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.

@@ -474,7 +474,7 @@ class TitansMemoryModule(nn.Module):
 
         out = mem_states.transpose(-2, -1).reshape(batch_size, seq_len, num_heads * head_dim)
         if self.use_gate and gate_states is not None:
-            # Apply gating and norm
+            # Apply gating and norm.0)
             out = self.gate_norm(out) * F.silu(gate_states)
 
         if self.use_output_proj:
@@ -539,6 +539,7 @@ class TitansMemoryModule(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cache: TitansCache | None = None,
     ) -> torch.Tensor:
         """
@@ -558,6 +559,12 @@ class TitansMemoryModule(nn.Module):
         key_states = self.conv_k(self.k_norm(key_states), cache=cache)
         value_states = self.v_proj(hidden_states).view(hidden_shape)
         value_states = self.conv_v(value_states, cache=cache)
+        gate_states = self.gate_proj(hidden_states) if self.use_gate else None
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, unsqueeze_dim=1
+        )
 
         # Split hidden states into chunks along the sequence dimension for update processing.
         num_chunks = (hidden_states.size(1) + self.chunk_size - 1) // self.chunk_size
@@ -569,8 +576,9 @@ class TitansMemoryModule(nn.Module):
             chunk_query_states = query_states[:, :, chunk_start:chunk_end, :]
             chunk_key_states = key_states[:, :, chunk_start:chunk_end, :]
             chunk_value_states = value_states[:, :, chunk_start:chunk_end, :]
+            chunk_gate_states = gate_states[:, chunk_start:chunk_end, :] if gate_states is not None else None
 
-            retrieved_chunk = self.retrieve(chunk_query_states)
+            retrieved_chunk = self.retrieve(chunk_query_states, chunk_gate_states)
             self.update(chunk_hidden_states, chunk_key_states, chunk_value_states, cache=cache)
             hidden_states[:, chunk_start:chunk_end, :] = retrieved_chunk
 
@@ -603,16 +611,20 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attn_layernorm = None
         self.post_memory_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head_dim = config.hidden_size // config.num_mem_heads
 
         # Persistent memory tokens.
         self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
-        self.persistent_mem = nn.Parameter(
-            torch.normal(
-                mean=0.0,
-                std=config.initializer_range,
-                size=(1, config.num_persistent_mem_tokens, config.hidden_size),
+        if self.num_persistent_mem_tokens > 0:
+            self.persistent_mem = nn.Parameter(
+                torch.normal(
+                    mean=0.0,
+                    std=config.initializer_range,
+                    size=(1, config.num_persistent_mem_tokens, config.hidden_size),
+                )
             )
-        )
+        else:
+            self.persistent_mem = None
 
     def forward(
         self,
@@ -622,18 +634,28 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
         cache: TitansCache | None = None,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
 
-        # Concatenate persistent memory tokens
-        persistent_mem = self.persistent_mem.expand(hidden_states.size(0), -1, -1)
-        hidden_states = torch.cat([persistent_mem, hidden_states], dim=1)
         hidden_states = self.input_layernorm(hidden_states)
         # Self-Attention block would go here for non-LMM variants.
-        hidden_states = self.memory(hidden_states=hidden_states, cache=cache)
-        # Remove persistent memory tokens
-        hidden_states = hidden_states[:, self.num_persistent_mem_tokens:, :]
+        # hidden_states = self.self_attn(...)
+        # Concatenate persistent memory tokens if applicable.
+        if self.persistent_mem is not None:
+            batch_size = hidden_states.size(0)
+            persistent_mem_expanded = self.persistent_mem.expand(batch_size, -1, -1)
+            hidden_states = torch.cat([persistent_mem_expanded, hidden_states], dim=1)
+
+        hidden_states = self.memory(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            cache=cache
+        )
+        # Remove persistent memory tokens after attn/memory module processing.
+        if self.persistent_mem is not None:
+            hidden_states = hidden_states[:, self.num_persistent_mem_tokens:, :]
         hidden_states = residual + hidden_states
 
         # MLP block
@@ -665,12 +687,14 @@ class TitansModel(TitansPreTrainedModel):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
         self.layers = nn.ModuleList(
             [TitansDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.final_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = TitansRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -709,6 +733,8 @@ class TitansModel(TitansPreTrainedModel):
             self.reset_params(batch_size=inputs_embeds.size(0))
 
         hidden_states = inputs_embeds
+        position_ids = torch.arange(0, hidden_states.size(1) + self.num_persistent_mem_tokens, device=hidden_states.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
@@ -718,6 +744,7 @@ class TitansModel(TitansPreTrainedModel):
                 cache=cache,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
         hidden_states = self.final_norm(hidden_states)

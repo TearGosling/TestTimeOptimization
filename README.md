@@ -28,11 +28,13 @@ Please make sure your GPUs can support these libraries. I'll add alternative nat
 
 # Architecture Implementation Checklist
 
-- [ ] [**Learning to (Learn at Test Time): RNNs with Expressive Hidden States**](https://arxiv.org/abs/2407.04620)
-- [ ] [**Titans: Learning to Memorize at Test Time**](https://arxiv.org/abs/2501.00663)
+- [X] [**Learning to (Learn at Test Time): RNNs with Expressive Hidden States**](https://arxiv.org/abs/2407.04620) (copied from the [official implementation](https://github.com/test-time-training/ttt-lm-pytorch))
+- [X] [**Titans: Learning to Memorize at Test Time**](https://arxiv.org/abs/2501.00663) (LMM variant only at the moment)
 - [ ] [**Test-Time Training Done Right**](https://arxiv.org/abs/2505.23884)
 - [ ] [**ATLAS: Learning to Optimally Memorize the Context at Test Time**](https://arxiv.org/abs/2505.23735)
 - [ ] [**TNT: Improving Chunkwise Training For Test-Time Memorization**](https://arxiv.org/abs/2511.07343)
 - [ ] [**ViT³: Unlocking Test-Time Training in Vision**](https://arxiv.org/abs/2512.01643)
+- [ ] [**It's All Connected: A Journey Through Test-Time Memorization, Attentional Bias, Retention, and Online Optimization**](https://arxiv.org/abs/2504.13173) (all variants)
+- [ ] [**Nested Learning: The Illusion of Deep Learning Architecture**](https://arxiv.org/abs/2512.24695)
 
 Will add more papers as I find them.
