@@ -14,16 +14,71 @@ class TitansConfig(PretrainedConfig):
     documentation from [`PretrainedConfig`] for more information.
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 32000):
+        vocab_size (`int`, *optional*, defaults to 32768):
             Vocabulary size of the Titans model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`TitansModel`]
-        hidden_size (`int`, *optional*, defaults to 4096):
+        hidden_size (`int`, *optional*, defaults to 2048):
             Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 11008):
+        intermediate_size (`int`, *optional*, defaults to 5504):
             Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the Transformer decoder.
-        
+        num_hidden_layers (`int`, *optional*, defaults to 24):
+            Number of hidden layers in the Titans model.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) in the model.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+            The epsilon used by the rms normalization layers.
+        use_cache (`bool`, *optional*, defaults to `False`):
+            Whether or not the model should return the last key/values attentions and memory states.
+        pad_token_id (`int`, *optional*):
+            Padding token id.
+        bos_token_id (`int`, *optional*, defaults to 1):
+            Beginning of stream token id.
+        eos_token_id (`int`, *optional*, defaults to 2):
+            End of stream token id.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie weight embeddings.
+        conv_kernel (`int`, *optional*, defaults to 4):
+            Kernel size for the convolutional layers.
+        attention_conv (`bool`, *optional*, defaults to `False`):
+            Whether to apply convolution to the QKV projections in the attention layers.
+        rms_qk_norm (`bool`, *optional*, defaults to `False`):
+            Whether to apply RMS normalization to the query and key projections in the memory layers. If `False`, L2 normalization is used.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Titans model. Distinct from `num_mem_heads`.
+        num_key_value_heads (`int`, *optional*):
+            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
+            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
+            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
+            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
+            by meanpooling all the original heads within that group. For more details checkout [this
+            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
+            `num_attention_heads`.
+        sliding_window (`int`, *optional*, defaults to 2048):
+            Sliding window attention window size if using the `"mag"` or `"mal"` variants. If not specified, will default to `2048`.
+        rope_parameters (`RopeParameters`, *optional*):
+            Dictionary containing the configuration parameters for the RoPE embeddings. The dictionary should contain
+            a value for `rope_theta` and optionally parameters used for scaling in case you want to use RoPE
+            with longer `max_position_embeddings`.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        max_position_embeddings (`int`, *optional*, defaults to `2048*64`):
+            The maximum sequence length that this model might ever be used with. Note that this parameter applies only to rotary positional embeddings.
+        variant (`str`, *optional*, defaults to `"lmm"`):
+            The Titans variant to use. Four variants are supported: `"lmm"`(Titans memory module with no separate attention layer), `"mal"` (Memory as a Layer), `"mag"` (Memory as a Gate), and `"mac"` (Memory as a Context). Currently, only `"lmm"` is implemented.
+        chunk_size (`int`, *optional*, defaults to 8):
+            The chunk size (also known as "mini-batch size") to use for the memory layer updates.
+        mem_expansion_factor (`float`, *optional*, defaults to 4.0):
+            The expansion factor for the memory layer's MLP.
+        num_mem_heads (`int`, *optional*, defaults to 32):
+            Number of memory heads for each memory layer in the Titans model. Distinct from `num_attention_heads`.
+        num_persistent_mem_tokens (`int`, *optional*, defaults to 4):
+            Number of persistent memory tokens to use in each memory layer.
+        use_output_proj (`bool`, *optional*, defaults to `True`):
+            Whether to use an output projection layer in the memory layers.
+        use_gate (`bool`, *optional*, defaults to `True`):
+            Whether to use a gating mechanism in the memory layers.
     """
     model_type = "titans"
 
