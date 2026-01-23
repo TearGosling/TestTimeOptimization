@@ -94,7 +94,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class RMSNorm(nn.Module):
+class TTTRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -108,7 +108,7 @@ class RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class SwiGluMLP(nn.Module):
+class TTTGatedMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -146,7 +146,7 @@ class SwiGluMLP(nn.Module):
         return down_proj
 
 
-class RotaryEmbedding(nn.Module):
+class TTTRotaryEmbedding(nn.Module):
     def __init__(
         self,
         dim,
@@ -180,13 +180,13 @@ class RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class Conv(nn.Module):
+class TTTConv(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.conv = nn.Conv1d(
             config.hidden_size,
             config.hidden_size,
@@ -421,7 +421,7 @@ class TTTCache:
         return {name: self.ttt_params_dict[name][layer_idx] for name in self.ttt_params_dict}
 
 
-class TTTBase(nn.Module):
+class TTTBaseMemory(nn.Module):
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
@@ -489,7 +489,7 @@ class TTTBase(nn.Module):
 
     def _init_rope(self):
         self.rope_theta = self.config.rope_theta
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = TTTRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.mini_batch_size,
             base=self.rope_theta,
@@ -739,7 +739,7 @@ class TTTBase(nn.Module):
         return output_hidden_states
 
 
-class TTTLinear(TTTBase):
+class TTTLinearMemory(TTTBaseMemory):
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         # TTT model initialization for TTT-Linear
@@ -893,7 +893,7 @@ class TTTLinear(TTTBase):
         return XQW_batch, batch_params_dict
 
 
-class TTTMLP(TTTBase):
+class TTTMLPMemory(TTTBaseMemory):
     def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         # TTT model initialization for TTT-MLP
@@ -1097,27 +1097,27 @@ class TTTMLP(TTTBase):
 ################################
 
 
-class Block(nn.Module):
+class TTTBlock(nn.Module):
     def __init__(self, config: TTTConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.pre_conv = config.pre_conv
 
         if config.ttt_layer_type == "linear":
-            ttt_layer = TTTLinear
+            ttt_layer = TTTLinearMemory
         elif config.ttt_layer_type == "mlp":
-            ttt_layer = TTTMLP
+            ttt_layer = TTTMLPMemory
         else:
             raise ValueError(f"Invalid ttt_layer_type: {config.ttt_layer_type}")
 
         self.seq_modeling_block = ttt_layer(config=config, layer_idx=layer_idx)
 
-        self.mlp = SwiGluMLP(config)
+        self.mlp = TTTGatedMLP(config)
         if self.pre_conv:
-            self.conv = Conv(config, layer_idx)
+            self.conv = TTTConv(config, layer_idx)
 
-        self.seq_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.seq_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
     def forward(
@@ -1225,8 +1225,8 @@ class TTTModel(TTTPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList([TTTBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
