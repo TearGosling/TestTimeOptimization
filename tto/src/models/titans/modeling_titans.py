@@ -906,6 +906,8 @@ class TitansDecoderLayer(nn.Module):
             persistent_mem_expanded = self.persistent_mem.expand(batch_size, -1, -1)
             hidden_states = torch.cat([persistent_mem_expanded, hidden_states], dim=1)
 
+        hidden_states = self.input_layernorm(hidden_states)
+
         hidden_states = self.memory(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
