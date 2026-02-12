@@ -85,7 +85,7 @@ class TitansConfig(PretrainedConfig):
     def __init__(
         self,
         # General model settings
-        vocab_size: int | None = 32768,
+        vocab_size: int | None = 32000,
         hidden_size: int | None = 2048,
         intermediate_size: int | None = 5504,
         num_hidden_layers: int | None = 24,
@@ -115,6 +115,7 @@ class TitansConfig(PretrainedConfig):
         num_persistent_mem_tokens: int = 4,
         use_output_proj: bool = True,
         use_gate: bool = True,
+        scan_checkpoint_group_size: int = 8,
         **kwargs,
     ):
         if variant != "lmm":
@@ -153,6 +154,7 @@ class TitansConfig(PretrainedConfig):
         self.mem_expansion_factor = mem_expansion_factor
         self.use_output_proj = use_output_proj
         self.use_gate = use_gate
+        self.scan_checkpoint_group_size = scan_checkpoint_group_size
 
         super().__init__(
             pad_token_id=pad_token_id,

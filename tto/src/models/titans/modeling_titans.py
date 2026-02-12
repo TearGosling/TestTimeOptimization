@@ -1,10 +1,12 @@
+import math
+
 from collections.abc import Callable
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.utils._pytree import tree_map
 
 # All necessary for now, manually doing a `modeling_X.py` file from transformers but
 # later I can just use the transformers source tool.
@@ -25,15 +27,6 @@ if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 else:
     causal_conv1d_update, causal_conv1d_fn = None, None
-
-# TODO(TG): Implement fallback naive version of parallel scan later.
-try:
-    from accelerated_scan.scalar import scan
-except ImportError:
-    raise ImportError(
-        "Please install the accelerated-scan package: https://github.com/proger/accelerated-scan"
-        "You can install it via `pip install accelerated_scan`."
-    )
 
 from .configuration_titans import TitansConfig
 
@@ -57,7 +50,7 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
 
     return y
 
-def ln_fused_l2_bwd(x, pred, gamma, beta, eps=1e-6):
+def ln_fused_l2_bwd(x, residual, pred, gamma, beta, eps=1e-6):
     """
     Batch backward for LayerNorm fused with L2 loss.
     """
@@ -73,6 +66,8 @@ def ln_fused_l2_bwd(x, pred, gamma, beta, eps=1e-6):
 
     # Scale and shift
     y = gamma * x_hat + beta
+
+    y = y + residual # Residual
 
     # Derivative of L2 loss wrt activations.
     # TTT is cheeky by just having their loss function be 1/2 * ||mem - V||^2, thus eliminating
@@ -90,6 +85,168 @@ def ln_fused_l2_bwd(x, pred, gamma, beta, eps=1e-6):
     )
 
     return z
+
+def associative_scan_5d(gate, token, initial_state=None):
+    """
+    Vibe-coded scan but I've verified it is equivalent to the Triton scan fn.
+    Performs a parallel associative scan (prefix sum over a semiring) for the 
+    recurrence: x[t] = gate[t] * x[t-1] + token[t]
+    
+    This implementation uses the Hillis-Steele (recursive doubling) algorithm,
+    which is efficient on GPUs with O(log L) steps.
+
+    Args:
+        gate:  Tensor of shape [B, H, L, 1, 1]
+        token: Tensor of shape [B, H, L, D1, D2]
+        initial_state: Optional Tensor of shape [B, H, D1, D2]
+                       representing x[-1].
+
+    Returns:
+        Tensor of shape [B, H, L, D1, D2] representing the sequence x[t].
+    """
+    # 1. Validation and Setup
+    # We clone the inputs to avoid in-place modifications to the original tensors
+    # and to set up our accumulation buffers.
+    # Dimensions: 0:Batch, 1:Heads, 2:Seq_Len, 3:Dim1, 4:Dim2
+    curr_g = gate  # Ensure gate has shape [B, H, L, 1, 1]
+    curr_u = token
+
+    B, H, L, D1, D2 = token.shape
+    
+    # Calculate number of doubling steps required: ceil(log2(L))
+    num_steps = int(math.ceil(math.log2(L)))
+
+    # 2. The Associative Scan (Hillis-Steele Algorithm)
+    # At every step k, we combine element i with element (i - 2^k).
+    # The binary operator is: (a2, b2) o (a1, b1) = (a2 * a1, a2 * b1 + b2)
+    # where 'a' is the gate (multiplicative) and 'b' is the token (additive).
+    
+    for i in range(num_steps):
+        distance = 1 << i  # 2^i
+        
+        # We perform the operation only on the part of the sequence that has 
+        # a valid predecessor 'distance' steps back.
+        
+        # Slice for the "current" elements (indices distance to L)
+        g_now = curr_g[:, :, distance:, :, :]
+        u_now = curr_u[:, :, distance:, :, :]
+        
+        # Slice for the "previous" elements (indices 0 to L-distance)
+        g_prev = curr_g[:, :, :-distance, :, :]
+        u_prev = curr_u[:, :, :-distance, :, :]
+        
+        # New U: (g_now * u_prev + u_now)
+        u_new_part = g_now * u_prev + u_now
+        # New G: (g_now * g_prev)
+        g_new_part = g_now * g_prev
+        
+        # Concatenate the untouched prefix with the updated suffix
+        # This creates a NEW tensor, allowing the old one to be freed if not needed
+        # (autograd handles the graph connections cleanly)
+        curr_u = torch.cat([curr_u[:, :, :distance, :, :], u_new_part], dim=2)
+        curr_g = torch.cat([curr_g[:, :, :distance, :, :], g_new_part], dim=2)
+
+    # 3. Handle Initial State
+    # After the loop, curr_u contains the scan assuming x[-1] = 0.
+    # curr_g contains the cumulative product of gates (g_0...g_t).
+    # The actual result is: scan_result + cumprod_gates * initial_state
+    
+    if initial_state is not None:
+        # initial_state: [B, H, 1, D1, D2]
+        # curr_g:        [B, H, L, 1, 1]
+        # Broadcasting handles the dimension expansion automatically.
+        final_result = curr_u + (curr_g * initial_state)
+    else:
+        final_result = curr_u
+        
+    return final_result
+
+def sequential_scan(f, init, xs, checkpoint_group=0):
+    """
+    Fixed sequential scan that handles dicts correctly with checkpointing
+    and avoids side-effects on captured variables.
+    """
+    # Helper to unpack dicts to tuples (for checkpointing)
+    def to_tuple(x):
+        keys = sorted(x.keys())
+        return tuple(x[k] for k in keys), keys
+
+    def from_tuple(tup, keys):
+        return {k: v for k, v in zip(keys, tup)}
+
+    # Prepare inputs
+    if isinstance(xs, dict):
+        num_items = len(next(iter(xs.values())))
+    else:
+        num_items = len(xs[0])
+
+    carry = init
+    
+    # List to collect outputs (we will stack them later)
+    # We cannot write to 'out' tensor in-place efficiently if we want to be clean with autograd
+    # unless we carefully manage it. Collecting into a list is safer for memory in this context.
+    outputs = []
+
+    def scan_fn(carry_tup, carry_keys, start, end):
+        # Reconstruct carry dict
+        curr_carry = from_tuple(carry_tup, carry_keys)
+        chunk_outputs = []
+        
+        for i in range(start, end):
+            # Slice input
+            if isinstance(xs, dict):
+                x_i = {k: v[i] for k, v in xs.items()}
+            else:
+                x_i = [x[i] for x in xs]
+            
+            curr_carry, y = f(curr_carry, x_i)
+            chunk_outputs.append(y)
+            
+        # Stack chunk outputs: [chunk_len, ...]
+        stacked_out = torch.stack(chunk_outputs, dim=0)
+        
+        # Return new carry tuple AND the outputs for this chunk
+        new_carry_tup, _ = to_tuple(curr_carry)
+        return new_carry_tup, stacked_out
+
+    curr_idx = 0
+    while curr_idx < num_items:
+        # Determine chunk size for this step
+        if checkpoint_group > 0:
+            step_size = min(checkpoint_group, num_items - curr_idx)
+        else:
+            step_size = num_items # Run all at once
+            
+        end_idx = curr_idx + step_size
+        
+        carry_tup, carry_keys = to_tuple(carry)
+        
+        if checkpoint_group > 0:
+            # Checkpoint requires inputs to be tensors. 
+            # We pass carry tensors individually (via unpacking) to ensure grad flows.
+            # scan_fn returns (new_carry_tuple, output_tensor)
+            new_carry_tup, chunk_out = torch.utils.checkpoint.checkpoint(
+                scan_fn, 
+                carry_tup, 
+                carry_keys, 
+                curr_idx, 
+                end_idx, 
+                use_reentrant=False
+            )
+        else:
+            new_carry_tup, chunk_out = scan_fn(carry_tup, carry_keys, curr_idx, end_idx)
+            
+        # Update carry
+        carry = from_tuple(new_carry_tup, carry_keys)
+        
+        # Collect output
+        outputs.append(chunk_out)
+        curr_idx = end_idx
+
+    # Concatenate all outputs along time dimension (dim 0 here, because we stacked locally)
+    # output shape: [seq_len, batch, ...]
+    final_output = torch.cat(outputs, dim=0)
+    return carry, final_output
 
 class TitansRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -149,7 +306,7 @@ class TitansRotaryEmbedding(nn.Module):
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
         base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_mem_heads
 
         attention_factor = 1.0  # Unused in this type of RoPE
 
@@ -247,7 +404,7 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
-def parallel_scan(
+def old_parallel_scan(
     decays: torch.Tensor,
     values: torch.Tensor,
     init_value: torch.Tensor,
@@ -377,6 +534,7 @@ class TitansMemoryModule(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.num_heads = config.num_mem_heads
         self.head_dim = config.hidden_size // config.num_mem_heads
         self.chunk_size = config.chunk_size
 
@@ -400,27 +558,6 @@ class TitansMemoryModule(nn.Module):
         self.surprise_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
         self.lr_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
 
-        # Additional details about projections in the Titans memory module layer is a bit confusing
-        # between the paper and implementations. The paper mentions using a GSS (Mehta et al. 2023)
-        # style of gating with additional gate proj and an output proj. TTT uses an output proj but leaves
-        # mamba-style gating as optional. The lucidrains implementation does not use gating
-        # and only optionally includes an output projection. The related papers ATLAS and MIRAS,
-        # built on Titans by the same authors, uses gating but no output projection, only a post-norm
-        # on the memory output (Fig 2. MIRAS, Fig 3. ATLAS). But GSS - the cited arch - doesn't have a post-norm,
-        # it has a shared prenorm on the input! TTT has a post-norm but it's not optional regardless of whether you gate or not!
-        # It is a chaotic fucking mess out there, to put it bluntly. There are many more inconsistencies I haven't even mentioned here.
-        # The paper mentions gating, "normalization" (doesn't specify which), and an output projection.
-        # We will implement all of these as options. By default, I will assume post-norm, gating, and output proj.
-        # These can be turned off in the config separately if desired - it may not be worth the extra param cost.
-        # Sorry for the crashout, code reader!
-        self.use_gate = config.use_gate
-        self.use_output_proj = config.use_output_proj
-        if self.use_output_proj:
-            self.o_proj = nn.Linear(config.num_mem_heads * self.head_dim, config.hidden_size, bias=False)
-        if self.use_gate:
-            self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            self.gate_norm = TitansRMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps) if config.rms_qk_norm else l2_norm
-
         mem_intermediate_size = int(self.head_dim * config.mem_expansion_factor)
         # MLP acting as our memory module.
         self.W1 = nn.Parameter(
@@ -440,70 +577,69 @@ class TitansMemoryModule(nn.Module):
         # LayerNorm for memory output.
         self.norm_w = nn.Parameter(torch.ones(config.num_mem_heads, self.head_dim))
         self.norm_b = nn.Parameter(torch.zeros(config.num_mem_heads, self.head_dim))
-
-        # Contains current state of the memory module parameters and their momentums.
-        # Re-initialized at every forward pass if cache is None.
-        self.params_dict = None
-
-    def reset_params(self, batch_size: int) -> None:
-        """
-        Resets the memory module parameters to initial states.
-        """
-        new_W1_shape = (batch_size, *self.W1.shape)
-        new_W2_shape = (batch_size, *self.W2.shape)
-        self.params_dict = {
-            "W1": self.W1.unsqueeze(0).expand(*new_W1_shape),
-            "W2": self.W2.unsqueeze(0).expand(*new_W2_shape),
-            "W1_surprise": torch.zeros(new_W1_shape, device=self.W1.device, dtype=self.W1.dtype),
-            "W2_surprise": torch.zeros(new_W2_shape, device=self.W2.device, dtype=self.W2.dtype),
-        }
-
-    def retrieve(self, query_states: torch.Tensor, gate_states: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Retrieves information from the memory module.
-        Combines with gating and output projection if specified.
-        """
-        batch_size, num_heads, seq_len, head_dim = query_states.shape
-        W1 = self.params_dict["W1"]
-        W2 = self.params_dict["W2"]
-
-        # Pass through memory MLP
-        mem_states = query_states @ W1  # [batch, num_heads, seq_len, mem_intermediate_size]
-        mem_states = F.silu(mem_states)
-        mem_states = mem_states @ W2  # [batch, num_heads, seq_len, head_dim]
-
-        out = mem_states.transpose(-2, -1).reshape(batch_size, seq_len, num_heads * head_dim)
-        if self.use_gate and gate_states is not None:
-            # Apply gating and norm.0)
-            out = self.gate_norm(out) * F.silu(gate_states)
-
-        if self.use_output_proj:
-            out = self.o_proj(out)
-
-        return out
     
-    def update(self, hidden_states: torch.Tensor, key_states: torch.Tensor, value_states: torch.Tensor, cache: TitansCache | None = None) -> None:
+    def _reshape_pytree(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Updates the memory module with new information.
+        Reshaping function to prepare tensors for scan.
         """
-        # Grab current params.
-        W1 = self.params_dict["W1"]
-        W2 = self.params_dict["W2"]
-        W1_surprise = self.params_dict["W1_surprise"]
-        W2_surprise = self.params_dict["W2_surprise"]
+        # control signals shape: [batch_size, seq_len, hidden_size]
+        # qkv shape: [batch_size, num_heads, seq_len, head_dim]
+        is_full_chunk = t.size(-2) % self.chunk_size == 0
+        if is_full_chunk:
+            if t.dim() == 3:
+                t = t.unfold(1, self.chunk_size, self.chunk_size).permute(1, 0, 3, 2)  # [num_chunks, batch_size, chunk_size, hidden_size]
+            elif t.dim() == 4:
+                t = t.unfold(2, self.chunk_size, self.chunk_size).permute(2, 0, 1, 4, 3)  # [num_chunks, batch_size, num_heads, head_dim, chunk_size]
+            else:
+                raise ValueError(f"Unexpected tensor dimension {t.dim()} during pytree reshape")
+        else:
+            t = t.unsqueeze(0)
+        return t
 
-        # Get decays (1 - alpha in Titans paper) and LR
+    def chunk_forward(
+        self,
+        params_dict: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor]
+    ) -> tuple[dict[torch.Tensor], torch.Tensor]:
+        query_states = inputs["query_states"]
+        key_states = inputs["key_states"]
+        value_states = inputs["value_states"]
+
         # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len]
-        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)).transpose(-2, -1)
-        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states)).transpose(-2, -1)[..., None, None] # Extra 2 dims required for parallel scan
-        lr = torch.sigmoid(self.lr_proj(hidden_states)).transpose(-2, -1)
+        mem_decay = inputs["mem_decay"].transpose(-2, -1)
+        surprise_decay = inputs["surprise_decay"].transpose(-2, -1)[..., None, None] # Extra 2 dims required for parallel scan
+        lr = inputs["lr"].transpose(-2, -1)
 
+        # LR scaling is required for stable training.
+        # Titans does not say how LR is scaled.
+        # Lucidrains just multiplies by 0.1 or 0.01, so we'll do the same for now.
+        lr = 0.01 * lr
+
+        W1 = params_dict["W1"]
+        W2 = params_dict["W2"]
+        W1_surprise = params_dict["W1_surprise"]
+        W2_surprise = params_dict["W2_surprise"]
+        # Norm which gets us to grads wrt activations.
+        ln_weight = self.norm_w.reshape(1, query_states.size(1), 1, self.head_dim)
+        ln_bias = self.norm_b.reshape(1, query_states.size(1), 1, self.head_dim)
+
+        # 1. Query retrieval from memory.
+        Q_W1 = query_states @ W1
+        Q_Z1 = F.silu(Q_W1)
+        Q_W2 = Q_Z1 @ W2
+        # layernorm
+        upd_query_states = ln_fwd(Q_W2, ln_weight, ln_bias)
+
+        # Residual, assuming this based on TTT and other papers.
+        upd_query_states = query_states + upd_query_states
+
+        # 2. Update parameter dictionary
+        
         # Beta calculation as per Titans paper.
         betas = torch.cumprod(mem_decay, dim=-1)
         beta_T = betas[:, :, -1:]
-
-        # Avoid division by zero
         mem_decay_factors = beta_T / (betas + 1e-8)
+        
         effective_lr = (lr * mem_decay_factors).unsqueeze(-1)
 
         # Keys fed through memory module
@@ -512,10 +648,7 @@ class TitansMemoryModule(nn.Module):
         X1 = F.silu(Z1)
         mems = X1 @ W2  # [batch, num_heads, seq_len, head_dim]
         
-        # Norm which gets us to grads wrt activations.
-        ln_weight = self.norm_w.reshape(1, mems.size(1), 1, self.head_dim)
-        ln_bias = self.norm_b.reshape(1, mems.size(1), 1, self.head_dim)
-        grad_wrt_mems = ln_fused_l2_bwd(mems, value_states, ln_weight, ln_bias)
+        grad_wrt_mems = ln_fused_l2_bwd(mems, key_states, value_states, ln_weight, ln_bias)
         grad_wrt_Z1 = grad_wrt_mems @ W2.transpose(-2, -1) * silu_backward(Z1)  # [batch, num_heads, seq_len, mem_intermediate_size]
 
         # Compute gradients for W1 and W2.
@@ -523,18 +656,23 @@ class TitansMemoryModule(nn.Module):
         grad_W1_t = -1.0 * torch.einsum('bhsd,bhsi,bhsi->bhsdi', key_states, grad_wrt_Z1, effective_lr)
 
         # Calculate new surprises via. associative scans.
-        W1_surprise = parallel_scan(surprise_decay, grad_W1_t, init_value=W1_surprise) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
-        W2_surprise = parallel_scan(surprise_decay, grad_W2_t, init_value=W2_surprise) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
+        new_W1_surprise = associative_scan_5d(surprise_decay, grad_W1_t, initial_state=W1_surprise.unsqueeze(2)) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
+        new_W2_surprise = associative_scan_5d(surprise_decay, grad_W2_t, initial_state=W2_surprise.unsqueeze(2)) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
 
         # Update weights
-        beta_T = beta_T.unsqueeze(-1)
-        W1 = beta_T * W1 + W1_surprise[:, :, -1]
-        W2 = beta_T * W2 + W2_surprise[:, :, -1]
+        new_W1 = W1 + new_W1_surprise[:, :, -1]
+        new_W2 = W2 + new_W2_surprise[:, :, -1]
+        new_W1_surprise = new_W1_surprise[:, :, -1]
+        new_W2_surprise = new_W2_surprise[:, :, -1]
+
         # Update params dict with new weights and surprises at end of the chunk.
-        self.params_dict["W1"] = W1
-        self.params_dict["W2"] = W2
-        self.params_dict["W1_surprise"] = W1_surprise[:, :, -1]
-        self.params_dict["W2_surprise"] = W2_surprise[:, :, -1]
+        new_params_dict = {
+            "W1": new_W1,
+            "W2": new_W2,
+            "W1_surprise": new_W1_surprise,
+            "W2_surprise": new_W2_surprise,
+        }
+        return new_params_dict, upd_query_states
     
     def forward(
         self,
@@ -559,29 +697,150 @@ class TitansMemoryModule(nn.Module):
         key_states = self.conv_k(self.k_norm(key_states), cache=cache)
         value_states = self.v_proj(hidden_states).view(hidden_shape)
         value_states = self.conv_v(value_states, cache=cache)
-        gate_states = self.gate_proj(hidden_states) if self.use_gate else None
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, unsqueeze_dim=1
         )
 
-        # Split hidden states into chunks along the sequence dimension for update processing.
-        num_chunks = (hidden_states.size(1) + self.chunk_size - 1) // self.chunk_size
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.chunk_size
-            chunk_end = min((chunk_idx + 1) * self.chunk_size, hidden_states.size(1))
+        # Control signals projection.
+        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)) # (1 - alpha) in Titans paper.
+        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states))
+        lr = torch.sigmoid(self.lr_proj(hidden_states))
 
-            chunk_hidden_states = hidden_states[:, chunk_start:chunk_end, :]
-            chunk_query_states = query_states[:, :, chunk_start:chunk_end, :]
-            chunk_key_states = key_states[:, :, chunk_start:chunk_end, :]
-            chunk_value_states = value_states[:, :, chunk_start:chunk_end, :]
-            chunk_gate_states = gate_states[:, chunk_start:chunk_end, :] if gate_states is not None else None
+        # Split hidden states into chunks along the sequence dimension for sequential states.
+        output_hidden_states = []
+        num_full_chunks = hidden_states.size(1) // self.chunk_size
+        remainder_len = hidden_states.size(1) % self.chunk_size
 
-            retrieved_chunk = self.retrieve(chunk_query_states, chunk_gate_states)
-            self.update(chunk_hidden_states, chunk_key_states, chunk_value_states, cache=cache)
-            hidden_states[:, chunk_start:chunk_end, :] = retrieved_chunk
+        # Process full chunks with sequential scan.
+        params_dict = {
+            "W1": torch.tile(self.W1.unsqueeze(0), dims=(input_shape[0], 1, 1, 1)),
+            "W2": torch.tile(self.W2.unsqueeze(0), dims=(input_shape[0], 1, 1, 1)),
+        }
+        params_dict["W1_surprise"] = torch.zeros_like(params_dict["W1"])
+        params_dict["W2_surprise"] = torch.zeros_like(params_dict["W2"])
 
+        if num_full_chunks > 0:
+            # Allocate empty output tensor.
+            full_inputs = {
+                "query_states": query_states[:, :, :num_full_chunks * self.chunk_size, :],
+                "key_states": key_states[:, :, :num_full_chunks * self.chunk_size, :],
+                "value_states": value_states[:, :, :num_full_chunks * self.chunk_size, :],
+                "mem_decay": mem_decay[:, :num_full_chunks * self.chunk_size, :],
+                "surprise_decay": surprise_decay[:, :num_full_chunks * self.chunk_size, :],
+                "lr": lr[:, :num_full_chunks * self.chunk_size, :],
+            }
+            full_inputs = tree_map(lambda x: self._reshape_pytree(x), full_inputs)
+            params_dict, output_full = sequential_scan(
+                self.chunk_forward,
+                init=params_dict,
+                xs=full_inputs,
+                checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0,
+            )
+            # Reshape output back to [batch_size, seq_len, hidden_size]
+            output_full = output_full.permute(1, 0, 2, 3, 4).reshape(input_shape[0], num_full_chunks * self.chunk_size, -1)
+            output_hidden_states.append(output_full)
+        if remainder_len > 0:
+            remainder_inputs = {
+                "query_states": query_states[:, :, -remainder_len:, :],
+                "key_states": key_states[:, :, -remainder_len:, :],
+                "value_states": value_states[:, :, -remainder_len:, :],
+                "mem_decay": mem_decay[:, -remainder_len:, :],
+                "surprise_decay": surprise_decay[:, -remainder_len:, :],
+                "lr": lr[:, -remainder_len:, :],
+            }
+            remainder_inputs = tree_map(lambda x: self._reshape_pytree(x), remainder_inputs)
+            _, output_remainder = sequential_scan(
+                self.chunk_forward,
+                init=params_dict,
+                xs=remainder_inputs,
+                checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0,
+            )
+            output_remainder = output_remainder.squeeze(0).permute(0, 2, 1, 3).reshape(input_shape[0], remainder_len, -1)
+            output_hidden_states.append(output_remainder)
+
+        output_hidden_states = torch.cat(output_hidden_states, dim=1)
+
+        return output_hidden_states
+    
+class TitansSeqModelBlock(nn.Module):
+    def __init__(self, config: TitansConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = config.hidden_size // config.num_mem_heads
+
+        self.self_attn = None # Will change when implementing non-LMM variants.
+        self.memory = TitansMemoryModule(config, layer_idx)
+
+        # Additional details about projections in the Titans memory module layer is a bit confusing
+        # between the paper and implementations. The paper mentions using a GSS (Mehta et al. 2023)
+        # style of gating with additional gate proj and an output proj. TTT uses an output proj but leaves
+        # mamba-style gating as optional. The lucidrains implementation does not use gating
+        # and only optionally includes an output projection. The related papers ATLAS and MIRAS,
+        # built on Titans by the same authors, uses gating but no output projection, only a post-norm
+        # on the memory output (Fig 2. MIRAS, Fig 3. ATLAS). But GSS - the cited arch - doesn't have a post-norm,
+        # it has a shared prenorm on the input! TTT has a post-norm but it's not optional regardless of whether you gate or not!
+        # It is a chaotic fucking mess out there, to put it bluntly. There are many more inconsistencies I haven't even mentioned here.
+        # The paper mentions gating, "normalization" (doesn't specify which), and an output projection.
+        # We will implement all of these as options. By default, I will assume post-norm, gating, and output proj.
+        # These can be turned off in the config separately if desired - it may not be worth the extra param cost.
+        # Sorry for the crashout, code reader!
+        self.use_gate = config.use_gate
+        self.use_output_proj = config.use_output_proj
+        self.out_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.use_output_proj:
+            self.o_proj = nn.Linear(config.num_mem_heads * self.head_dim, config.hidden_size, bias=False)
+        if self.use_gate:
+            self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+        # Persistent memory tokens.
+        self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
+        if self.num_persistent_mem_tokens > 0:
+            self.persistent_mem = nn.Parameter(
+                torch.normal(
+                    mean=0.0,
+                    std=config.initializer_range,
+                    size=(1, config.num_persistent_mem_tokens, config.hidden_size),
+                )
+            )
+        else:
+            self.persistent_mem = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache: TitansCache | None = None
+    ) -> torch.Tensor:
+        # NOTE(TG): This forward function will get more complex when we implement non-LMM variants with attention.
+        if self.use_gate:
+            gate_values = F.silu(self.gate_proj(hidden_states))
+
+        # Concatenate persistent memory tokens if applicable.
+        if self.persistent_mem is not None:
+            batch_size = hidden_states.size(0)
+            persistent_mem_expanded = self.persistent_mem.expand(batch_size, -1, -1)
+            hidden_states = torch.cat([persistent_mem_expanded, hidden_states], dim=1)
+
+        hidden_states = self.memory(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            cache=cache
+        )
+
+        hidden_states = self.out_norm(hidden_states)
+
+        # Remove persistent memory tokens after attn/memory module processing.
+        if self.persistent_mem is not None:
+            hidden_states = hidden_states[:, self.num_persistent_mem_tokens:, :]
+
+        if self.use_gate:
+            # Modulate memory output with gate values.
+            hidden_states = gate_values * hidden_states
+        if self.use_output_proj:
+            hidden_states = self.o_proj(hidden_states)
         return hidden_states
 
 class TitansMLP(nn.Module):
@@ -599,7 +858,7 @@ class TitansMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
     
-class TitansDecoderLayer(GradientCheckpointingLayer):
+class TitansDecoderLayer(nn.Module):
     def __init__(self, config: TitansConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -639,7 +898,6 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
         # Self-Attention block would go here for non-LMM variants.
         # hidden_states = self.self_attn(...)
         # Concatenate persistent memory tokens if applicable.
@@ -700,13 +958,6 @@ class TitansModel(TitansPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def reset_params(self, batch_size: int) -> None:
-        """
-        Resets the memory module parameters for all layers.
-        """
-        for layer in self.layers:
-            layer.memory.reset_params(batch_size)
-
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -727,10 +978,6 @@ class TitansModel(TitansPreTrainedModel):
         if use_cache and cache is None:
             # TODO(TG): Implement cache later.
             use_cache = False
-
-        if not use_cache and cache is None:
-            # Reset memory module params if no cache is provided.
-            self.reset_params(batch_size=inputs_embeds.size(0))
 
         hidden_states = inputs_embeds
         position_ids = torch.arange(0, hidden_states.size(1) + self.num_persistent_mem_tokens, device=hidden_states.device).unsqueeze(0)
