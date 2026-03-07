@@ -65,7 +65,7 @@ options:
 
 ---
 
-# Training (very unstable for Titans)
+# Training
 
 Use `train.py` to train a model using a config. The script is extremely basic for now; the Hugging Face `Trainer` class is used to train the models and the script supports single-GPU only.
 
@@ -103,4 +103,4 @@ training_args:
   report_to: "wandb"
 ```
 
-Training on Titans is currently **very unstable**, with high grad norms. I'm investigating the cause of this. An example config, `titans_lmm_300m.yml`, has been provided in the `configs` folder as an example. It will train on an RTX 3090, taking up roughly 18 GB of VRAM. I will work on getting that number to drop lower later.
+An example config, `titans_lmm_300m.yml`, has been provided in the `configs` folder as an example. It will train on an RTX 3090, taking up roughly 18 GB of VRAM. I will work on getting that number to drop lower later.

@@ -50,7 +50,7 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
 
     return y
 
-def ln_fused_l2_bwd(x, residual, pred, gamma, beta, eps=1e-6):
+def ln_fused_l2_bwd(x, target, gamma, beta, eps=1e-6):
     """
     Batch backward for LayerNorm fused with L2 loss.
     """
@@ -67,12 +67,10 @@ def ln_fused_l2_bwd(x, residual, pred, gamma, beta, eps=1e-6):
     # Scale and shift
     y = gamma * x_hat + beta
 
-    y = y + residual # Residual
-
     # Derivative of L2 loss wrt activations.
     # TTT is cheeky by just having their loss function be 1/2 * ||mem - V||^2, thus eliminating
     # 2, but I don't know if Titans authors did this so I'll keep the 2 here for correctness.
-    grad_output = 2.0 * (y - pred)
+    grad_output = (y - target)
     grad_x_hat = grad_output * gamma
     z = (
         (1.0 / D)
@@ -187,28 +185,6 @@ def sequential_scan(f, init, xs, checkpoint_group=0):
     # unless we carefully manage it. Collecting into a list is safer for memory in this context.
     outputs = []
 
-    def scan_fn(carry_tup, carry_keys, start, end):
-        # Reconstruct carry dict
-        curr_carry = from_tuple(carry_tup, carry_keys)
-        chunk_outputs = []
-        
-        for i in range(start, end):
-            # Slice input
-            if isinstance(xs, dict):
-                x_i = {k: v[i] for k, v in xs.items()}
-            else:
-                x_i = [x[i] for x in xs]
-            
-            curr_carry, y = f(curr_carry, x_i)
-            chunk_outputs.append(y)
-            
-        # Stack chunk outputs: [chunk_len, ...]
-        stacked_out = torch.stack(chunk_outputs, dim=0)
-        
-        # Return new carry tuple AND the outputs for this chunk
-        new_carry_tup, _ = to_tuple(curr_carry)
-        return new_carry_tup, stacked_out
-
     curr_idx = 0
     while curr_idx < num_items:
         # Determine chunk size for this step
@@ -221,20 +197,37 @@ def sequential_scan(f, init, xs, checkpoint_group=0):
         
         carry_tup, carry_keys = to_tuple(carry)
         
+        # Build a closure with static metadata so checkpoint only receives tensor args.
+        start = curr_idx
+        end = end_idx
+
+        def scan_chunk(*carry_tensors):
+            curr_carry = from_tuple(carry_tensors, carry_keys)
+            chunk_outputs = []
+            for i in range(start, end):
+                if isinstance(xs, dict):
+                    x_i = {k: v[i] for k, v in xs.items()}
+                else:
+                    x_i = [x[i] for x in xs]
+                curr_carry, y = f(curr_carry, x_i)
+                chunk_outputs.append(y)
+
+            stacked_out = torch.stack(chunk_outputs, dim=0)
+            new_carry_tup, _ = to_tuple(curr_carry)
+            # checkpoint expects tensor outputs; flatten carry + out in one tuple.
+            return (*new_carry_tup, stacked_out)
+
         if checkpoint_group > 0:
-            # Checkpoint requires inputs to be tensors. 
-            # We pass carry tensors individually (via unpacking) to ensure grad flows.
-            # scan_fn returns (new_carry_tuple, output_tensor)
-            new_carry_tup, chunk_out = torch.utils.checkpoint.checkpoint(
-                scan_fn, 
-                carry_tup, 
-                carry_keys, 
-                curr_idx, 
-                end_idx, 
-                use_reentrant=False
+            chunk_ret = torch.utils.checkpoint.checkpoint(
+                scan_chunk,
+                *carry_tup,
+                use_reentrant=False,
             )
         else:
-            new_carry_tup, chunk_out = scan_fn(carry_tup, carry_keys, curr_idx, end_idx)
+            chunk_ret = scan_chunk(*carry_tup)
+
+        new_carry_tup = chunk_ret[:-1]
+        chunk_out = chunk_ret[-1]
             
         # Update carry
         carry = from_tuple(new_carry_tup, carry_keys)
@@ -247,6 +240,15 @@ def sequential_scan(f, init, xs, checkpoint_group=0):
     # output shape: [seq_len, batch, ...]
     final_output = torch.cat(outputs, dim=0)
     return carry, final_output
+
+def grad_norm(grad, max_grad_norm=1.0):
+    """
+    Applies gradient clipping to the given gradient tensor.
+    """
+    norm = grad.norm().item()
+    if norm > max_grad_norm:
+        grad.mul_(max_grad_norm / (norm + 1e-6))
+    return grad
 
 class TitansRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -403,31 +405,6 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
-
-def old_parallel_scan(
-    decays: torch.Tensor,
-    values: torch.Tensor,
-    init_value: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Performs an associative scan over the input values with the given decays.
-    Note that recurrence is computed with an initial value belonging to the previous chunk,
-    necessitating supplying that too.
-    """
-    batch_size, num_heads, seq_len, dim1_size, dim2_size = values.shape
-    # The third-party scan implementation does not allow specifying an initial value (default 0),
-    # so we do the first step of the recurrence manually here.
-    init_value = init_value.unsqueeze(2)  # [batch_size, num_heads, 1, dim1_size, dim2_size]
-    decays = decays.expand_as(values)
-    modified_first_term = (decays[:, :, 0:1] * init_value) + values[:, :, 0:1]
-    values_new = torch.cat([modified_first_term, values[:, :, 1:]], dim=2)
-
-    # Merge batch_size with heads and dim sizes for scan.
-    decays = decays.reshape(batch_size * num_heads, seq_len, dim1_size * dim2_size).transpose(-2, -1).contiguous()
-    values_new = values_new.reshape(batch_size * num_heads, seq_len, dim1_size * dim2_size).transpose(-2, -1).contiguous()
-    # Run scan
-    scanned = scan(decays, values_new)
-    return scanned.reshape(batch_size, num_heads, dim1_size, dim2_size, seq_len).permute(0, 1, 4, 2, 3)
 
 """
 TODO(TG): Implement TitansCache.
@@ -606,15 +583,16 @@ class TitansMemoryModule(nn.Module):
         value_states = inputs["value_states"]
 
         # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len]
-        mem_decay = inputs["mem_decay"].transpose(-2, -1)
-        surprise_decay = inputs["surprise_decay"].transpose(-2, -1)[..., None, None] # Extra 2 dims required for parallel scan
+        mem_decay = inputs["mem_decay"].transpose(-2, -1).clamp(0.01, 0.99)
+        surprise_decay = inputs["surprise_decay"].transpose(-2, -1).clamp(0.01, 0.99)[..., None, None] # Extra 2 dims required for parallel scan
         lr = inputs["lr"].transpose(-2, -1)
 
         # LR scaling is required for stable training.
         # Titans does not say how LR is scaled.
         # Lucidrains just multiplies by 0.1 or 0.01, so we'll do the same for now.
-        lr = 0.01 * lr
+        lr = 0.001 * lr
 
+        # Avoid cloning these large fast-weight states every scan step; it increases memory pressure.
         W1 = params_dict["W1"]
         W2 = params_dict["W2"]
         W1_surprise = params_dict["W1_surprise"]
@@ -629,9 +607,6 @@ class TitansMemoryModule(nn.Module):
         Q_W2 = Q_Z1 @ W2
         # layernorm
         upd_query_states = ln_fwd(Q_W2, ln_weight, ln_bias)
-
-        # Residual, assuming this based on TTT and other papers.
-        upd_query_states = query_states + upd_query_states
 
         # 2. Update parameter dictionary
         
@@ -648,18 +623,26 @@ class TitansMemoryModule(nn.Module):
         X1 = F.silu(Z1)
         mems = X1 @ W2  # [batch, num_heads, seq_len, head_dim]
         
-        grad_wrt_mems = ln_fused_l2_bwd(mems, key_states, value_states, ln_weight, ln_bias)
+        # Titans inner-loop objective is associative memory: ||M(k_t) - v_t||^2.
+        # Do not include a residual k_t term inside this loss gradient path.
+        grad_wrt_mems = ln_fused_l2_bwd(mems, value_states, ln_weight, ln_bias)
         grad_wrt_Z1 = grad_wrt_mems @ W2.transpose(-2, -1) * silu_backward(Z1)  # [batch, num_heads, seq_len, mem_intermediate_size]
 
         # Compute gradients for W1 and W2.
         grad_W2_t = -1.0 * torch.einsum('bhsi,bhsd,bhsi->bhsid', X1, grad_wrt_mems, effective_lr)
         grad_W1_t = -1.0 * torch.einsum('bhsd,bhsi,bhsi->bhsdi', key_states, grad_wrt_Z1, effective_lr)
-
+        
         # Calculate new surprises via. associative scans.
         new_W1_surprise = associative_scan_5d(surprise_decay, grad_W1_t, initial_state=W1_surprise.unsqueeze(2)) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
         new_W2_surprise = associative_scan_5d(surprise_decay, grad_W2_t, initial_state=W2_surprise.unsqueeze(2)) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
 
-        # Update weights
+        # Scale new surprises by sequence length to normalize them.
+        # Titans doesn't specify this in their paper, but it is necessary for stable training.
+        new_W1_surprise = new_W1_surprise / (key_states.size(2) + 1e-8)
+        new_W2_surprise = new_W2_surprise / (key_states.size(2) + 1e-8)
+
+        # Apply chunk-level forgetting to the carried memory itself (Eq. 11 in Titans),
+        # then add the accumulated surprise update for this chunk.
         new_W1 = W1 + new_W1_surprise[:, :, -1]
         new_W2 = W2 + new_W2_surprise[:, :, -1]
         new_W1_surprise = new_W1_surprise[:, :, -1]

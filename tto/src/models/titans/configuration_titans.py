@@ -106,7 +106,7 @@ class TitansConfig(PretrainedConfig):
         sliding_window: int | None = 2048,
         rope_parameters: RopeParameters | dict[str, RopeParameters] = None,
         attention_dropout: float | None = 0.0,
-        max_position_embeddings: int | None = 2048 * 64,
+        max_position_embeddings: int | None = 2048,
         # Titans memory layer settings
         variant: str = "lmm",
         chunk_size: int = 8,

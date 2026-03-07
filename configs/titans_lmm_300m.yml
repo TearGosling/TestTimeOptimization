@@ -13,13 +13,14 @@ model:
   num_mem_heads: 16
   num_persistent_mem_tokens: 4
   use_output_proj: true
-  use_gate: false
-  scan_checkpoint_group_size: 16
+  use_gate: true
+  scan_checkpoint_group_size: 8
+  rms_qk_norm: true
 tokenizer: "NousResearch/Llama-2-7b-hf"
 training_args:
   device: "cuda"
   gradient_checkpointing: true
-  learning_rate: 0.0004
+  learning_rate: 0.0001
   logging_steps: 1
   lr_scheduler_type: "cosine"
   max_grad_norm: 1.0

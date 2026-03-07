@@ -8,13 +8,15 @@ from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    DataCollatorWithPadding,
+    default_data_collator,
     Trainer,
     TrainingArguments
 )
 from yaml import safe_load
 
 from tto import * # Necessary to register AutoConfig/AutoModel mappings
+
+os.environ["WANDB_PROJECT"] = "titans-fineweb"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = logging.getLogger(__name__)
@@ -37,11 +39,14 @@ def tokenize_function(examples, tokenizer, max_length=2048):
     out = tokenizer(
         examples["text"],
         truncation=True,
-        padding=True,
+        padding="max_length",
         max_length=max_length,
-        return_tensors="pt",
     )
-    out["labels"] = out.input_ids.clone()
+    # Ignore padding positions in LM loss.
+    out["labels"] = [
+        [token_id if mask == 1 else -100 for token_id, mask in zip(ids, masks)]
+        for ids, masks in zip(out["input_ids"], out["attention_mask"])
+    ]
     return out
 
 def main():
@@ -88,12 +93,7 @@ def main():
         num_proc = config["dataset"].get("num_proc", os.cpu_count()),
     )
 
-    collate_fn = DataCollatorWithPadding(
-        tokenizer=tokenizer,
-        max_length=config["dataset"]["max_seq_length"],
-        return_tensors="pt",
-        #padding='max_length'
-    )
+    collate_fn = default_data_collator
     LOG.info("Starting training...")
     trainer = Trainer(
         model=model,
