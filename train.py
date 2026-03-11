@@ -3,6 +3,7 @@ import logging
 import os
 
 import torch
+torch.cuda.memory._record_memory_history(max_entries=500000, enabled="all", context="all", stacks="all")
 
 from datasets import load_dataset
 from transformers import (
@@ -10,7 +11,7 @@ from transformers import (
     AutoModelForCausalLM,
     default_data_collator,
     Trainer,
-    TrainingArguments
+    TrainingArguments,
 )
 from yaml import safe_load
 
@@ -50,6 +51,7 @@ def tokenize_function(examples, tokenizer, max_length=2048):
     return out
 
 def main():
+
     parser = argparse.ArgumentParser(description="Train a TTO model given a config.")
     parser.add_argument("config_file", type=str, help="Path to the YAML configuration file.")
     args = parser.parse_args()

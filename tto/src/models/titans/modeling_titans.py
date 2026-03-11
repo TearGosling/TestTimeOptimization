@@ -84,81 +84,6 @@ def ln_fused_l2_bwd(x, target, gamma, beta, eps=1e-6):
 
     return z
 
-def associative_scan_5d(gate, token, initial_state=None):
-    """
-    Vibe-coded scan but I've verified it is equivalent to the Triton scan fn.
-    Performs a parallel associative scan (prefix sum over a semiring) for the 
-    recurrence: x[t] = gate[t] * x[t-1] + token[t]
-    
-    This implementation uses the Hillis-Steele (recursive doubling) algorithm,
-    which is efficient on GPUs with O(log L) steps.
-
-    Args:
-        gate:  Tensor of shape [B, H, L, 1, 1]
-        token: Tensor of shape [B, H, L, D1, D2]
-        initial_state: Optional Tensor of shape [B, H, D1, D2]
-                       representing x[-1].
-
-    Returns:
-        Tensor of shape [B, H, L, D1, D2] representing the sequence x[t].
-    """
-    # 1. Validation and Setup
-    # We clone the inputs to avoid in-place modifications to the original tensors
-    # and to set up our accumulation buffers.
-    # Dimensions: 0:Batch, 1:Heads, 2:Seq_Len, 3:Dim1, 4:Dim2
-    curr_g = gate  # Ensure gate has shape [B, H, L, 1, 1]
-    curr_u = token
-
-    B, H, L, D1, D2 = token.shape
-    
-    # Calculate number of doubling steps required: ceil(log2(L))
-    num_steps = int(math.ceil(math.log2(L)))
-
-    # 2. The Associative Scan (Hillis-Steele Algorithm)
-    # At every step k, we combine element i with element (i - 2^k).
-    # The binary operator is: (a2, b2) o (a1, b1) = (a2 * a1, a2 * b1 + b2)
-    # where 'a' is the gate (multiplicative) and 'b' is the token (additive).
-    
-    for i in range(num_steps):
-        distance = 1 << i  # 2^i
-        
-        # We perform the operation only on the part of the sequence that has 
-        # a valid predecessor 'distance' steps back.
-        
-        # Slice for the "current" elements (indices distance to L)
-        g_now = curr_g[:, :, distance:, :, :]
-        u_now = curr_u[:, :, distance:, :, :]
-        
-        # Slice for the "previous" elements (indices 0 to L-distance)
-        g_prev = curr_g[:, :, :-distance, :, :]
-        u_prev = curr_u[:, :, :-distance, :, :]
-        
-        # New U: (g_now * u_prev + u_now)
-        u_new_part = g_now * u_prev + u_now
-        # New G: (g_now * g_prev)
-        g_new_part = g_now * g_prev
-        
-        # Concatenate the untouched prefix with the updated suffix
-        # This creates a NEW tensor, allowing the old one to be freed if not needed
-        # (autograd handles the graph connections cleanly)
-        curr_u = torch.cat([curr_u[:, :, :distance, :, :], u_new_part], dim=2)
-        curr_g = torch.cat([curr_g[:, :, :distance, :, :], g_new_part], dim=2)
-
-    # 3. Handle Initial State
-    # After the loop, curr_u contains the scan assuming x[-1] = 0.
-    # curr_g contains the cumulative product of gates (g_0...g_t).
-    # The actual result is: scan_result + cumprod_gates * initial_state
-    
-    if initial_state is not None:
-        # initial_state: [B, H, 1, D1, D2]
-        # curr_g:        [B, H, L, 1, 1]
-        # Broadcasting handles the dimension expansion automatically.
-        final_result = curr_u + (curr_g * initial_state)
-    else:
-        final_result = curr_u
-        
-    return final_result
-
 def sequential_scan(f, init, xs, checkpoint_group=0):
     """
     Fixed sequential scan that handles dicts correctly with checkpointing
@@ -583,20 +508,20 @@ class TitansMemoryModule(nn.Module):
         value_states = inputs["value_states"]
 
         # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len]
-        mem_decay = inputs["mem_decay"].transpose(-2, -1).clamp(0.01, 0.99)
-        surprise_decay = inputs["surprise_decay"].transpose(-2, -1).clamp(0.01, 0.99)[..., None, None] # Extra 2 dims required for parallel scan
+        mem_decay = inputs["mem_decay"].transpose(-2, -1)
+        surprise_decay = inputs["surprise_decay"].transpose(-2, -1)
         lr = inputs["lr"].transpose(-2, -1)
 
         # LR scaling is required for stable training.
         # Titans does not say how LR is scaled.
-        # Lucidrains just multiplies by 0.1 or 0.01, so we'll do the same for now.
+        # Lucidrains just multiplies by 0.1 or 0.01, so we'll do 0.001; provides necessary stability
         lr = 0.001 * lr
 
-        # Avoid cloning these large fast-weight states every scan step; it increases memory pressure.
         W1 = params_dict["W1"]
         W2 = params_dict["W2"]
         W1_surprise = params_dict["W1_surprise"]
         W2_surprise = params_dict["W2_surprise"]
+        
         # Norm which gets us to grads wrt activations.
         ln_weight = self.norm_w.reshape(1, query_states.size(1), 1, self.head_dim)
         ln_bias = self.norm_b.reshape(1, query_states.size(1), 1, self.head_dim)
@@ -609,44 +534,52 @@ class TitansMemoryModule(nn.Module):
         upd_query_states = ln_fwd(Q_W2, ln_weight, ln_bias)
 
         # 2. Update parameter dictionary
-        
-        # Beta calculation as per Titans paper.
-        betas = torch.cumprod(mem_decay, dim=-1)
-        beta_T = betas[:, :, -1:]
-        mem_decay_factors = beta_T / (betas + 1e-8)
-        
-        effective_lr = (lr * mem_decay_factors).unsqueeze(-1)
 
         # Keys fed through memory module
         # Pass through memory MLP
         Z1 = key_states @ W1  # [batch, num_heads, seq_len, mem_intermediate_size]
         X1 = F.silu(Z1)
         mems = X1 @ W2  # [batch, num_heads, seq_len, head_dim]
-        
+
         # Titans inner-loop objective is associative memory: ||M(k_t) - v_t||^2.
-        # Do not include a residual k_t term inside this loss gradient path.
         grad_wrt_mems = ln_fused_l2_bwd(mems, value_states, ln_weight, ln_bias)
         grad_wrt_Z1 = grad_wrt_mems @ W2.transpose(-2, -1) * silu_backward(Z1)  # [batch, num_heads, seq_len, mem_intermediate_size]
 
-        # Compute gradients for W1 and W2.
-        grad_W2_t = -1.0 * torch.einsum('bhsi,bhsd,bhsi->bhsid', X1, grad_wrt_mems, effective_lr)
-        grad_W1_t = -1.0 * torch.einsum('bhsd,bhsi,bhsi->bhsdi', key_states, grad_wrt_Z1, effective_lr)
+        c = torch.zeros_like(mem_decay)
+        e = torch.zeros_like(mem_decay)
+
+        c[..., -1] = 1.0
+        e[..., -1] = 1.0
+
+        cum_gamma = mem_decay[..., -1].clone()
+
+        for t in range(mem_decay.size(-1) - 2, -1, -1):
+            e[..., t] = e[..., t + 1] * surprise_decay[..., t + 1]
+            c[..., t] = cum_gamma + surprise_decay[..., t + 1] * c[..., t + 1]
+            cum_gamma = cum_gamma * mem_decay[..., t]
+
+        gamma_total = mem_decay.prod(dim=-1, keepdim=True)
+        eta_total = surprise_decay.prod(dim=-1, keepdim=True)
+
+        m_S0 = surprise_decay[..., 0] * c[..., 0]
         
-        # Calculate new surprises via. associative scans.
-        new_W1_surprise = associative_scan_5d(surprise_decay, grad_W1_t, initial_state=W1_surprise.unsqueeze(2)) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
-        new_W2_surprise = associative_scan_5d(surprise_decay, grad_W2_t, initial_state=W2_surprise.unsqueeze(2)) # [batch_size, num_heads, seq_len, head_dim, mem_intermediate_size]
+        U1_lr = key_states * lr.unsqueeze(-1)
+        U2_lr = X1 * lr.unsqueeze(-1)
 
-        # Scale new surprises by sequence length to normalize them.
-        # Titans doesn't specify this in their paper, but it is necessary for stable training.
-        new_W1_surprise = new_W1_surprise / (key_states.size(2) + 1e-8)
-        new_W2_surprise = new_W2_surprise / (key_states.size(2) + 1e-8)
+        U1_W = U1_lr * c.unsqueeze(-1)
+        U1_S = U1_lr * e.unsqueeze(-1)
+        U2_W = U2_lr * c.unsqueeze(-1)
+        U2_S = U2_lr * e.unsqueeze(-1)
 
-        # Apply chunk-level forgetting to the carried memory itself (Eq. 11 in Titans),
-        # then add the accumulated surprise update for this chunk.
-        new_W1 = W1 + new_W1_surprise[:, :, -1]
-        new_W2 = W2 + new_W2_surprise[:, :, -1]
-        new_W1_surprise = new_W1_surprise[:, :, -1]
-        new_W2_surprise = new_W2_surprise[:, :, -1]
+        W1_grad_sum = torch.matmul(U1_W.transpose(-1, -2), grad_wrt_Z1)
+        S1_grad_sum = torch.matmul(U1_S.transpose(-1, -2), grad_wrt_Z1)
+        W2_grad_sum = torch.matmul(U2_W.transpose(-1, -2), grad_wrt_mems)
+        S2_grad_sum = torch.matmul(U2_S.transpose(-1, -2), grad_wrt_mems)
+
+        new_W1 = (gamma_total.unsqueeze(-1) * W1) + (m_S0.unsqueeze(-1).unsqueeze(-1) * W1_surprise) - W1_grad_sum
+        new_W1_surprise = (eta_total.unsqueeze(-1) * W1_surprise) - S1_grad_sum
+        new_W2 = (gamma_total.unsqueeze(-1) * W2) + (m_S0.unsqueeze(-1).unsqueeze(-1) * W2_surprise) - W2_grad_sum
+        new_W2_surprise = (eta_total.unsqueeze(-1) * W2_surprise) - S2_grad_sum
 
         # Update params dict with new weights and surprises at end of the chunk.
         new_params_dict = {
