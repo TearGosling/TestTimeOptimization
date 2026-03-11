@@ -3,7 +3,6 @@ import logging
 import os
 
 import torch
-torch.cuda.memory._record_memory_history(max_entries=500000, enabled="all", context="all", stacks="all")
 
 from datasets import load_dataset
 from transformers import (
