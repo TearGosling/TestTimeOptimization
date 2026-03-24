@@ -17,7 +17,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel, ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, TransformersKwargs, logging
 from transformers.utils.generic import maybe_autocast
@@ -68,8 +68,7 @@ def ln_fused_l2_bwd(x, target, gamma, beta, eps=1e-6):
     y = gamma * x_hat + beta
 
     # Derivative of L2 loss wrt activations.
-    # TTT is cheeky by just having their loss function be 1/2 * ||mem - V||^2, thus eliminating
-    # 2, but I don't know if Titans authors did this so I'll keep the 2 here for correctness.
+    # Loss can be 1/2 * ||y - target||^2 according to Titans Appendix C, so grad is (y - target).
     grad_output = (y - target)
     grad_x_hat = grad_output * gamma
     z = (
@@ -233,7 +232,7 @@ class TitansRotaryEmbedding(nn.Module):
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
         base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_mem_heads
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
 
         attention_factor = 1.0  # Unused in this type of RoPE
 
@@ -426,10 +425,116 @@ class TitansConv(nn.Module):
         # TODO(TG): Optimize reshape/transposes.
         hidden_states = hidden_states.reshape(bsz, n_heads, head_dim, seq_len).transpose(-1, -2)
         return hidden_states
+    
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
 
-# TODO(TG): Implement TitansAttention later for non-LMM variants.
-class TitansAttention:
-    pass
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+class TitansAttention(nn.Module):
+    def __init__(self, config: TitansConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim ** -0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+        self.variant = config.variant
+        self.chunk_size = config.chunk_size
+        self.attention_conv = config.attention_conv
+
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+
+        # NOTE(TG): Titans paper states they use L2 normalization for QK, but lucidrains and convention
+        # uses RMSnorm. I'm providing the option for either.
+        self.q_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else lambda x: F.normalize(x, p=2.0, dim=-1)
+        self.k_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else lambda x: F.normalize(x, p=2.0, dim=-1)
+
+        # NOTE(TG): Titans paper mentions they put convolutions on the QKV projections, but it's unclear on whether they do this to the
+        # attention layer or not as well. Providing the option for either.
+        if config.attention_conv:
+            self.conv_q = TitansConv(config, layer_idx, conv_name="attn_q")
+            self.conv_k = TitansConv(config, layer_idx, conv_name="attn_k")
+            self.conv_v = TitansConv(config, layer_idx, conv_name="attn_v")
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        cache: TitansCache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        past_key_values = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        if self.attention_conv:
+            # Apply convolution to QKV
+            query_states = self.conv_q(query_states, cache=cache)
+            key_states = self.conv_k(key_states, cache=cache)
+            value_states = self.conv_v(value_states, cache=cache)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
 
 class TitansMemoryModule(nn.Module):
     def __init__(self, config: TitansConfig, layer_idx: int):
@@ -593,7 +698,6 @@ class TitansMemoryModule(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cache: TitansCache | None = None,
     ) -> torch.Tensor:
         """
@@ -613,11 +717,6 @@ class TitansMemoryModule(nn.Module):
         key_states = self.conv_k(self.k_norm(key_states), cache=cache)
         value_states = self.v_proj(hidden_states).view(hidden_shape)
         value_states = self.conv_v(value_states, cache=cache)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, unsqueeze_dim=1
-        )
 
         # Control signals projection.
         mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)) # (1 - alpha) in Titans paper.
@@ -686,9 +785,17 @@ class TitansSeqModelBlock(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = config.hidden_size // config.num_mem_heads
+        self.variant = config.variant
+        # Temp block from unimplemented MAC
+        if self.variant == "mac":
+            raise NotImplementedError("MAC variant not implemented yet - will be done in a future update.")
 
-        self.self_attn = None # Will change when implementing non-LMM variants.
         self.memory = TitansMemoryModule(config, layer_idx)
+        self.self_attn = TitansAttention(config, layer_idx) if self.variant != "lmm" else None
+
+        if self.variant == "mag":
+            self.post_mem_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attn_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Additional details about projections in the Titans memory module layer is a bit confusing
         # between the paper and implementations. The paper mentions using a GSS (Mehta et al. 2023)
@@ -705,7 +812,7 @@ class TitansSeqModelBlock(nn.Module):
         # Sorry for the crashout, code reader!
         self.use_gate = config.use_gate
         self.use_output_proj = config.use_output_proj
-        self.out_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
         if self.use_output_proj:
             self.o_proj = nn.Linear(config.num_mem_heads * self.head_dim, config.hidden_size, bias=False)
         if self.use_gate:
@@ -740,13 +847,34 @@ class TitansSeqModelBlock(nn.Module):
             persistent_mem_expanded = self.persistent_mem.expand(batch_size, -1, -1)
             hidden_states = torch.cat([persistent_mem_expanded, hidden_states], dim=1)
 
-        hidden_states = self.memory(
+        mem_states = self.memory(
             hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
             cache=cache
         )
 
-        hidden_states = self.out_norm(hidden_states)
+        if self.variant == "mal":
+            # Feed memory output into attention - paper does this without a residual connection,
+            # will implement the option later.
+            attn_output, _ = self.self_attn(
+                mem_states,
+                position_embeddings=position_embeddings,
+                cache=cache
+            )
+            hidden_states = attn_output
+        elif self.variant == "mag":
+            # Gate memory output and attention. Paper notes that gating can be any non-linear function,
+            # we follow the paper in terms of norming both outputs and then doing GLU-style gating with SiLU.
+            attn_output, _ = self.self_attn(
+                mem_states,
+                position_embeddings=position_embeddings,
+                cache=cache
+            )
+            hidden_states = self.post_mem_layernorm(mem_states) * F.silu(self.post_attn_layernorm(attn_output))
+        elif self.variant == "lmm":
+            # Just memory, no attention.
+            hidden_states = mem_states
+        else:
+            raise ValueError(f"Unexpected variant {self.variant} in TitansSeqModelBlock. You shouldn't be seeing this.")
 
         # Remove persistent memory tokens after attn/memory module processing.
         if self.persistent_mem is not None:
@@ -757,6 +885,7 @@ class TitansSeqModelBlock(nn.Module):
             hidden_states = gate_values * hidden_states
         if self.use_output_proj:
             hidden_states = self.o_proj(hidden_states)
+
         return hidden_states
 
 class TitansMLP(nn.Module):
@@ -780,26 +909,12 @@ class TitansDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        self.self_attn = None # Will change when implementing non-LMM variants.
-        self.memory = TitansMemoryModule(config, layer_idx)
+        self.seq_model_block = TitansSeqModelBlock(config, layer_idx)
         self.mlp = TitansMLP(config)
-        self.input_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attn_layernorm = None
-        self.post_memory_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.head_dim = config.hidden_size // config.num_mem_heads
 
-        # Persistent memory tokens.
-        self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
-        if self.num_persistent_mem_tokens > 0:
-            self.persistent_mem = nn.Parameter(
-                torch.normal(
-                    mean=0.0,
-                    std=config.initializer_range,
-                    size=(1, config.num_persistent_mem_tokens, config.hidden_size),
-                )
-            )
-        else:
-            self.persistent_mem = None
+        self.input_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_seq_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head_dim = config.hidden_size // config.num_mem_heads
 
     def forward(
         self,
@@ -813,32 +928,21 @@ class TitansDecoderLayer(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
-
-        # Self-Attention block would go here for non-LMM variants.
-        # hidden_states = self.self_attn(...)
-        # Concatenate persistent memory tokens if applicable.
-        if self.persistent_mem is not None:
-            batch_size = hidden_states.size(0)
-            persistent_mem_expanded = self.persistent_mem.expand(batch_size, -1, -1)
-            hidden_states = torch.cat([persistent_mem_expanded, hidden_states], dim=1)
-
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.memory(
+        hidden_states = self.seq_model_block(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             cache=cache
         )
-        # Remove persistent memory tokens after attn/memory module processing.
-        if self.persistent_mem is not None:
-            hidden_states = hidden_states[:, self.num_persistent_mem_tokens:, :]
         hidden_states = residual + hidden_states
 
         # MLP block
         residual = hidden_states
-        hidden_states = self.post_memory_layernorm(hidden_states)
+        hidden_states = self.post_seq_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        
         return hidden_states
     
 class TitansPreTrainedModel(PreTrainedModel):

@@ -21,7 +21,7 @@ The usual.
 # Architecture Implementation Checklist
 
 - [X] [**Learning to (Learn at Test Time): RNNs with Expressive Hidden States**](https://arxiv.org/abs/2407.04620) (copied from the [official implementation](https://github.com/test-time-training/ttt-lm-pytorch))
-- [X] [**Titans: Learning to Memorize at Test Time**](https://arxiv.org/abs/2501.00663) (LMM variant only at the moment)
+- [X] [**Titans: Learning to Memorize at Test Time**](https://arxiv.org/abs/2501.00663) (LMM, MAG and MAL variants)
 - [ ] [**Test-Time Training Done Right**](https://arxiv.org/abs/2505.23884)
 - [ ] [**ATLAS: Learning to Optimally Memorize the Context at Test Time**](https://arxiv.org/abs/2505.23735)
 - [ ] [**TNT: Improving Chunkwise Training For Test-Time Memorization**](https://arxiv.org/abs/2511.07343)
@@ -103,4 +103,4 @@ training_args:
   report_to: "wandb"
 ```
 
-An example config, `titans_lmm_300m.yml`, has been provided in the `configs` folder as an example. It will train on an RTX 3090, taking up roughly 18 GB of VRAM. I will work on getting that number to drop lower later.
+There are two example configs in the `configs` folder you can use to train a model from scratch. These are not meant to be production-ready runs, but rather demonstrations. By default, it will save models to a `checkpoint` directory inside the repo folder. Change this as you wish.

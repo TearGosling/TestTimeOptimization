@@ -3,6 +3,6 @@ causal-conv1d
 datasets
 liger-kernel
 pyyaml
-transformers>=5.0.0
+transformers>=5.3.0
 torch>=2.6.0
 wandb

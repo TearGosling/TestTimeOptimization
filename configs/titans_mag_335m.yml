@@ -6,16 +6,18 @@ model:
   vocab_size: 32000
   hidden_size: 1024
   intermediate_size: 2736
-  num_attention_heads: 16
   num_hidden_layers: 16
   hidden_act: "silu"
-  variant: "lmm"
+  variant: "mal"
   chunk_size: 8
   num_mem_heads: 16
+  num_attention_heads: 16
+  num_key_value_heads: 4
   num_persistent_mem_tokens: 4
   use_output_proj: true
   use_gate: true
   scan_checkpoint_group_size: 8
+  sliding_window: 256
   rms_qk_norm: true
 tokenizer: "NousResearch/Llama-2-7b-hf"
 training_args:
@@ -27,13 +29,13 @@ training_args:
   max_grad_norm: 1.0
   per_device_train_batch_size: 4
   project: "tto-training"
-  output_dir: "./checkpoints/titans_lmm_300m_model"
+  output_dir: "./checkpoints/titans_mag_335m_model"
   num_train_epochs: 1
   report_to: "wandb"
   resume_from_checkpoint: null
   save_steps: 1000
   save_total_limit: 3
   seed: 80085
-  warmup_steps: 0.01
   torch_compile: false
+  #warmup_steps: 0.01
   weight_decay: 0.1

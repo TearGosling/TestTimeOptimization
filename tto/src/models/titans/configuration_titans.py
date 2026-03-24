@@ -118,8 +118,6 @@ class TitansConfig(PretrainedConfig):
         scan_checkpoint_group_size: int = 8,
         **kwargs,
     ):
-        if variant != "lmm":
-            raise NotImplementedError(f"Currently only 'lmm' variant is supported, got {variant}.")
         
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
