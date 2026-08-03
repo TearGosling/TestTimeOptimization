@@ -16,8 +16,6 @@ from yaml import safe_load
 
 from tto import * # Necessary to register AutoConfig/AutoModel mappings
 
-os.environ["WANDB_PROJECT"] = "titans-fineweb"
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +64,8 @@ def main():
     # resume_from_checkpoint is fed into Trainer separately
     resume_checkpoint = training_args.pop("resume_from_checkpoint", None)
     training_args = TrainingArguments(**training_args)
+    # Backup W&B project naming since HF Trainer likes putting everything under the 'huggingface' project
+    os.environ["WANDB_PROJECT"] = training_args.project
 
     LOG.info("Initializing tokenizer and model...")
     tokenizer = AutoTokenizer.from_pretrained(config["tokenizer"])

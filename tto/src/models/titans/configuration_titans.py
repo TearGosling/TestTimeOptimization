@@ -1,158 +1,194 @@
-from transformers import PretrainedConfig
-from transformers.modeling_rope_utils import RopeParameters
-from transformers.utils import logging
+# Copyright 2026 The Titans authors and Hugging Face contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Titans model configuration."""
 
-logger = logging.get_logger(__name__)
+from __future__ import annotations
 
-class TitansConfig(PretrainedConfig):
+from transformers.configuration_utils import PreTrainedConfig
+
+
+class TitansConfig(PreTrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`TitansModel`]. It is used to instantiate a Titans
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of a 1.5B param model.
+    Configuration class for [`TitansModel`] and [`TitansForCausalLM`].
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    The configuration exposes the long-term neural memory module from
+    "Titans: Learning to Memorize at Test Time" and the four supported
+    architecture variants:
+
+    - `"lmm"`: memory-only Long-term Memory Module sequence model.
+    - `"mac"`: Memory as a Context.
+    - `"mag"`: Memory as a Gate.
+    - `"mal"`: Memory as a Layer.
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 32768):
-            Vocabulary size of the Titans model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`TitansModel`]
-        hidden_size (`int`, *optional*, defaults to 2048):
-            Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 5504):
-            Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 24):
-            Number of hidden layers in the Titans model.
-        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-            The non-linear activation function (function or string) in the model.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
-            The epsilon used by the rms normalization layers.
-        use_cache (`bool`, *optional*, defaults to `False`):
-            Whether or not the model should return the last key/values attentions and memory states.
-        pad_token_id (`int`, *optional*):
-            Padding token id.
-        bos_token_id (`int`, *optional*, defaults to 1):
-            Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 2):
-            End of stream token id.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie weight embeddings.
-        conv_kernel (`int`, *optional*, defaults to 4):
-            Kernel size for the convolutional layers.
-        attention_conv (`bool`, *optional*, defaults to `False`):
-            Whether to apply convolution to the QKV projections in the attention layers.
-        rms_qk_norm (`bool`, *optional*, defaults to `False`):
-            Whether to apply RMS normalization to the query and key projections in the memory layers. If `False`, L2 normalization is used.
-        num_attention_heads (`int`, *optional*, defaults to 32):
-            Number of attention heads for each attention layer in the Titans model. Distinct from `num_mem_heads`.
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size.
+        hidden_size (`int`, *optional*, defaults to 768):
+            Decoder hidden size.
+        intermediate_size (`int`, *optional*, defaults to 2048):
+            SwiGLU feed-forward intermediate size.
+        num_hidden_layers (`int`, *optional*, defaults to 12):
+            Number of decoder blocks.
+        num_attention_heads (`int`, *optional*, defaults to 12):
+            Number of attention query heads.
         num_key_value_heads (`int`, *optional*):
-            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
-            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
-            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
-            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
-            by meanpooling all the original heads within that group. For more details checkout [this
-            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
+            Number of key/value heads for grouped-query attention. Defaults to
             `num_attention_heads`.
-        sliding_window (`int`, *optional*, defaults to 2048):
-            Sliding window attention window size if using the `"mag"` or `"mal"` variants. If not specified, will default to `2048`.
-        rope_parameters (`RopeParameters`, *optional*):
-            Dictionary containing the configuration parameters for the RoPE embeddings. The dictionary should contain
-            a value for `rope_theta` and optionally parameters used for scaling in case you want to use RoPE
-            with longer `max_position_embeddings`.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-        max_position_embeddings (`int`, *optional*, defaults to `2048*64`):
-            The maximum sequence length that this model might ever be used with. Note that this parameter applies only to rotary positional embeddings.
-        variant (`str`, *optional*, defaults to `"lmm"`):
-            The Titans variant to use. Four variants are supported: `"lmm"`(Titans memory module with no separate attention layer), `"mal"` (Memory as a Layer), `"mag"` (Memory as a Gate), and `"mac"` (Memory as a Context). Currently, only `"lmm"` is implemented.
-        chunk_size (`int`, *optional*, defaults to 8):
-            The chunk size (also known as "mini-batch size") to use for the memory layer updates.
-        mem_expansion_factor (`float`, *optional*, defaults to 4.0):
-            The expansion factor for the memory layer's MLP.
-        num_mem_heads (`int`, *optional*, defaults to 32):
-            Number of memory heads for each memory layer in the Titans model. Distinct from `num_attention_heads`.
-        num_persistent_mem_tokens (`int`, *optional*, defaults to 4):
-            Number of persistent memory tokens to use in each memory layer.
-        use_output_proj (`bool`, *optional*, defaults to `True`):
-            Whether to use an output projection layer in the memory layers.
-        use_gate (`bool`, *optional*, defaults to `True`):
-            Whether to use a gating mechanism in the memory layers.
+        variant (`str`, *optional*, defaults to `"mac"`):
+            Titans variant. One of `"lmm"`, `"mac"`, `"mag"`, or `"mal"`.
+        memory_num_heads (`int`, *optional*):
+            Number of independent memory heads. Defaults to
+            `num_attention_heads`.
+        memory_head_dim (`int`, *optional*):
+            Per-memory-head dimension. Defaults to
+            `hidden_size // memory_num_heads`.
+        memory_num_layers (`int`, *optional*, defaults to 2):
+            Number of layers in each per-head neural memory MLP. A value of 1
+            gives a linear associative memory.
+        memory_hidden_size (`int`, *optional*):
+            Hidden width of the memory MLP. Defaults to
+            `memory_mlp_expansion * memory_head_dim`.
+        memory_mlp_expansion (`int`, *optional*, defaults to 4):
+            Expansion factor used when `memory_hidden_size` is not supplied.
+        memory_chunk_size (`int`, *optional*, defaults to 16):
+            Chunk size used by the paper's parallel inner-loop training rule.
+        mac_segment_size (`int`, *optional*):
+            Segment size used by Memory as a Context. Defaults to
+            `memory_chunk_size`.
+        persistent_memory_tokens (`int`, *optional*, defaults to 4):
+            Number of learnable input-independent persistent memory tokens.
+        sliding_window (`int`, *optional*, defaults to 256):
+            Sliding-window size used by MAG and MAL attention. Use `None` for
+            full causal attention.
+        memory_theta_scale (`float`, *optional*, defaults to 1.0):
+            Scale for the data-dependent inner-loop learning rate theta.
+        memory_eta_scale (`float`, *optional*, defaults to 1.0):
+            Scale for the data-dependent surprise decay eta.
+        memory_alpha_scale (`float`, *optional*, defaults to 1.0):
+            Scale for the data-dependent memory decay alpha.
+        memory_theta_bias (`float`, *optional*, defaults to -2.0):
+            Initial learnable logit bias for the inner-loop learning rate theta.
+        memory_eta_bias (`float`, *optional*, defaults to 2.0):
+            Initial learnable logit bias for the surprise decay eta.
+        memory_alpha_bias (`float`, *optional*, defaults to -5.0):
+            Initial learnable logit bias for the memory decay alpha.
     """
+
     model_type = "titans"
+    keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        # General model settings
-        vocab_size: int | None = 32000,
-        hidden_size: int | None = 2048,
-        intermediate_size: int | None = 5504,
-        num_hidden_layers: int | None = 24,
-        hidden_act: str | None = "silu",
-        initializer_range: float | None = 0.02,
-        rms_norm_eps: float | None = 1e-6,
-        use_cache: bool | None = False,
+        vocab_size: int = 32000,
+        hidden_size: int = 768,
+        intermediate_size: int = 2048,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
         pad_token_id: int | None = None,
         bos_token_id: int | None = 1,
-        eos_token_id: int | None = 2,
-        tie_word_embeddings: bool | None = False,
-        conv_kernel: int | None = 4,
-        attention_conv: bool = False,
-        rms_qk_norm: bool = False,
-        # Attention and pos embed settings
-        num_attention_heads: int | None = 32,
-        num_key_value_heads: int | None = 8,
-        sliding_window: int | None = 2048,
-        rope_parameters: RopeParameters | dict[str, RopeParameters] = None,
-        attention_dropout: float | None = 0.0,
-        max_position_embeddings: int | None = 2048,
-        # Titans memory layer settings
-        variant: str = "lmm",
-        chunk_size: int = 8,
-        mem_expansion_factor: float = 4.0,
-        num_mem_heads: int = 32,
-        num_persistent_mem_tokens: int = 4,
-        use_output_proj: bool = True,
-        use_gate: bool = True,
-        scan_checkpoint_group_size: int = 8,
+        eos_token_id: int | list[int] | None = 2,
+        tie_word_embeddings: bool = True,
+        pretraining_tp: int = 1,
+        rope_theta: float = 10000.0,
+        attention_dropout: float = 0.0,
+        resid_dropout: float = 0.0,
+        variant: str = "mac",
+        memory_num_heads: int | None = None,
+        memory_head_dim: int | None = None,
+        memory_num_layers: int = 2,
+        memory_hidden_size: int | None = None,
+        memory_mlp_expansion: int = 4,
+        memory_activation: str = "silu",
+        memory_chunk_size: int = 16,
+        mac_segment_size: int | None = None,
+        persistent_memory_tokens: int = 4,
+        sliding_window: int | None = 256,
+        qkv_conv_kernel: int = 4,
+        attention_qkv_conv_kernel: int | None = None,
+        memory_qkv_conv_kernel: int | None = None,
+        use_attention_convolution: bool = True,
+        use_memory_convolution: bool = True,
+        memory_theta_scale: float = 1.0,
+        memory_eta_scale: float = 1.0,
+        memory_alpha_scale: float = 1.0,
+        memory_theta_bias: float = -2.0,
+        memory_eta_bias: float = 2.0,
+        memory_alpha_bias: float = -5.0,
+        memory_loss_scale: float | None = None,
+        l2_norm_eps: float = 1e-6,
+        use_parallel_memory_training: bool = True,
+        parallel_scan_epsilon: float = 1e-6,
+        gate_bias: float = 0.0,
         **kwargs,
     ):
-        
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_attention_heads if num_key_value_heads is None else num_key_value_heads
         self.hidden_act = hidden_act
-
+        self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        
-        self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.tie_word_embeddings = tie_word_embeddings
-
-        self.attention_conv = attention_conv
-        self.conv_kernel = conv_kernel
-        self.rms_qk_norm = rms_qk_norm
-
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.sliding_window = sliding_window
-        self.rope_parameters = rope_parameters
+        self.pretraining_tp = pretraining_tp
+        self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
-        self.max_position_embeddings = max_position_embeddings
-        
-        self.variant = variant
-        self.chunk_size = chunk_size
-        self.num_mem_heads = num_mem_heads
-        self.num_persistent_mem_tokens = num_persistent_mem_tokens
-        self.mem_expansion_factor = mem_expansion_factor
-        self.use_output_proj = use_output_proj
-        self.use_gate = use_gate
-        self.scan_checkpoint_group_size = scan_checkpoint_group_size
+        self.resid_dropout = resid_dropout
+
+        self.variant = variant.lower()
+        self.memory_num_heads = num_attention_heads if memory_num_heads is None else memory_num_heads
+        self.memory_head_dim = hidden_size // self.memory_num_heads if memory_head_dim is None else memory_head_dim
+        self.memory_num_layers = memory_num_layers
+        self.memory_mlp_expansion = memory_mlp_expansion
+        self.memory_hidden_size = (
+            self.memory_head_dim * memory_mlp_expansion if memory_hidden_size is None else memory_hidden_size
+        )
+        self.memory_activation = memory_activation
+        self.memory_chunk_size = memory_chunk_size
+        self.mac_segment_size = memory_chunk_size if mac_segment_size is None else mac_segment_size
+        self.persistent_memory_tokens = persistent_memory_tokens
+        self.sliding_window = sliding_window
+
+        self.qkv_conv_kernel = qkv_conv_kernel
+        self.attention_qkv_conv_kernel = (
+            qkv_conv_kernel if attention_qkv_conv_kernel is None else attention_qkv_conv_kernel
+        )
+        self.memory_qkv_conv_kernel = qkv_conv_kernel if memory_qkv_conv_kernel is None else memory_qkv_conv_kernel
+        self.use_attention_convolution = use_attention_convolution
+        self.use_memory_convolution = use_memory_convolution
+
+        self.memory_theta_scale = memory_theta_scale
+        self.memory_eta_scale = memory_eta_scale
+        self.memory_alpha_scale = memory_alpha_scale
+        self.memory_theta_bias = memory_theta_bias
+        self.memory_eta_bias = memory_eta_bias
+        self.memory_alpha_bias = memory_alpha_bias
+        self.memory_loss_scale = 1.0 / self.memory_head_dim if memory_loss_scale is None else memory_loss_scale
+        self.l2_norm_eps = l2_norm_eps
+        self.use_parallel_memory_training = use_parallel_memory_training
+        self.parallel_scan_epsilon = parallel_scan_epsilon
+        self.gate_bias = gate_bias
+
+        self._validate()
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -161,3 +197,29 @@ class TitansConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def _validate(self) -> None:
+        variants = {"lmm", "mac", "mag", "mal"}
+        if self.variant not in variants:
+            raise ValueError(f"`variant` must be one of {sorted(variants)}, got {self.variant!r}.")
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError("`hidden_size` must be divisible by `num_attention_heads`.")
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError("`num_attention_heads` must be divisible by `num_key_value_heads`.")
+        if self.memory_num_heads <= 0 or self.memory_head_dim <= 0:
+            raise ValueError("`memory_num_heads` and `memory_head_dim` must be positive.")
+        if self.memory_num_layers < 1:
+            raise ValueError("`memory_num_layers` must be at least 1.")
+        if self.memory_chunk_size < 1:
+            raise ValueError("`memory_chunk_size` must be at least 1.")
+        if self.mac_segment_size < 1:
+            raise ValueError("`mac_segment_size` must be at least 1.")
+        if self.persistent_memory_tokens < 0:
+            raise ValueError("`persistent_memory_tokens` cannot be negative.")
+        if self.sliding_window is not None and self.sliding_window < 1:
+            raise ValueError("`sliding_window` must be positive or `None`.")
+        if self.attention_qkv_conv_kernel < 1 or self.memory_qkv_conv_kernel < 1:
+            raise ValueError("Convolution kernels must be at least 1.")
+
+
+__all__ = ["TitansConfig"]

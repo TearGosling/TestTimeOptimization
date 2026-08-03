@@ -21,7 +21,7 @@ The usual.
 # Architecture Implementation Checklist
 
 - [X] [**Learning to (Learn at Test Time): RNNs with Expressive Hidden States**](https://arxiv.org/abs/2407.04620) (copied from the [official implementation](https://github.com/test-time-training/ttt-lm-pytorch))
-- [X] [**Titans: Learning to Memorize at Test Time**](https://arxiv.org/abs/2501.00663) (LMM, MAG and MAL variants)
+- [X] [**Titans: Learning to Memorize at Test Time**](https://arxiv.org/abs/2501.00663) (all variants)
 - [ ] [**Test-Time Training Done Right**](https://arxiv.org/abs/2505.23884)
 - [ ] [**ATLAS: Learning to Optimally Memorize the Context at Test Time**](https://arxiv.org/abs/2505.23735)
 - [ ] [**TNT: Improving Chunkwise Training For Test-Time Memorization**](https://arxiv.org/abs/2511.07343)
@@ -103,4 +103,17 @@ training_args:
   report_to: "wandb"
 ```
 
-There are two example configs in the `configs` folder you can use to train a model from scratch. These are not meant to be production-ready runs, but rather demonstrations. By default, it will save models to a `checkpoint` directory inside the repo folder. Change this as you wish.
+As an example for a pre-training run, refer to `configs/titans_lmm_120m.yml`. It will fit onto an RTX 3090. This repo is not yet meant to be for production-ready runs, but rather for now acting as a demonstration. By default, it will save models to a `checkpoint` directory inside the repo folder. Change this as you wish.
+
+---
+
+# TODOs (Agenda)
+
+Various other things besides architectures themselves I have to implement, eventually (in no particular order):
+
+- [ ] Add proper parallel associative scan implementation
+- [ ] Reduce redundancy by creating a common utils file
+- [ ] Add custom Triton kernels
+- [ ] Production-ready inference and training scripts
+- [ ] Customizable model architectures
+- [ ] Find good hyperparameters for example runs

@@ -1,1070 +1,1317 @@
-import math
+from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Optional
+import math
+from dataclasses import dataclass
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils._pytree import tree_map
+from torch.nn import CrossEntropyLoss
+from transformers import initialization as init
 
-# All necessary for now, manually doing a `modeling_X.py` file from transformers but
-# later I can just use the transformers source tool.
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel, ALL_ATTENTION_FUNCTIONS
-from transformers.processing_utils import Unpack
-from transformers.utils import ModelOutput, TransformersKwargs, logging
-from transformers.utils.generic import maybe_autocast
-from transformers.utils.import_utils import is_causal_conv1d_available
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import ModelOutput, logging
 
-if is_causal_conv1d_available():
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-else:
-    causal_conv1d_update, causal_conv1d_fn = None, None
+try:
+    from .configuration_titans import TitansConfig
+except ImportError:  # pragma: no cover - supports direct file imports.
+    from configuration_titans import TitansConfig
 
-from .configuration_titans import TitansConfig
 
 logger = logging.get_logger(__name__)
 
-# TODO(TG): Create utils file later for these common modules.
-def ln_fwd(x, gamma, beta, eps=1e-6):
-    """
-    Batch forward for LayerNorm.
-    """
-    # Mean and variance computation
-    mu = x.mean(dim=-1, keepdim=True)
-    var = x.var(dim=-1, keepdim=True, unbiased=False)
 
-    # Normalization
-    std = torch.sqrt(var + eps)
-    x_hat = (x - mu) / std
+def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    """This function is intended to align with the l2norm implementation in the FLA library."""
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
 
-    # Scale and shift
-    y = gamma * x_hat + beta
 
-    return y
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-def ln_fused_l2_bwd(x, target, gamma, beta, eps=1e-6):
-    """
-    Batch backward for LayerNorm fused with L2 loss.
-    """
-    D = x.shape[-1]
 
-    # Mean and variance computation
-    mu = x.mean(dim=-1, keepdim=True)
-    var = x.var(dim=-1, keepdim=True, unbiased=False)
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
-    # Normalization
-    std = torch.sqrt(var + eps)
-    x_hat = (x - mu) / std
 
-    # Scale and shift
-    y = gamma * x_hat + beta
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
 
-    # Derivative of L2 loss wrt activations.
-    # Loss can be 1/2 * ||y - target||^2 according to Titans Appendix C, so grad is (y - target).
-    grad_output = (y - target)
-    grad_x_hat = grad_output * gamma
-    z = (
-        (1.0 / D)
-        * (
-            D * grad_x_hat
-            - grad_x_hat.sum(dim=-1, keepdim=True)
-            - x_hat * (grad_x_hat * x_hat).sum(dim=-1, keepdim=True)
+
+def _activation_grad(name: str, x: torch.Tensor) -> torch.Tensor:
+    name = name.lower()
+    if name in {"silu", "swish"}:
+        sig = torch.sigmoid(x)
+        return sig * (1.0 + x * (1.0 - sig))
+    if name == "gelu":
+        # Approximate GELU
+        tanh_out = torch.tanh(0.79788456 * x * (1.0 + 0.044715 * x * x))
+        return 0.5 * (1.0 + tanh_out) + 0.5 * x * (1.0 - tanh_out * tanh_out) * (
+            0.79788456 + 0.1070322243 * x * x
         )
-        / std
-    )
+    if name == "relu":
+        return (x > 0).to(dtype=x.dtype)
+    if name == "tanh":
+        y = torch.tanh(x)
+        return 1.0 - y * y
+    raise ValueError(f"Unsupported differentiable memory activation {name!r}.")
 
-    return z
-
-def sequential_scan(f, init, xs, checkpoint_group=0):
-    """
-    Fixed sequential scan that handles dicts correctly with checkpointing
-    and avoids side-effects on captured variables.
-    """
-    # Helper to unpack dicts to tuples (for checkpointing)
-    def to_tuple(x):
-        keys = sorted(x.keys())
-        return tuple(x[k] for k in keys), keys
-
-    def from_tuple(tup, keys):
-        return {k: v for k, v in zip(keys, tup)}
-
-    # Prepare inputs
-    if isinstance(xs, dict):
-        num_items = len(next(iter(xs.values())))
-    else:
-        num_items = len(xs[0])
-
-    carry = init
-    
-    # List to collect outputs (we will stack them later)
-    # We cannot write to 'out' tensor in-place efficiently if we want to be clean with autograd
-    # unless we carefully manage it. Collecting into a list is safer for memory in this context.
-    outputs = []
-
-    curr_idx = 0
-    while curr_idx < num_items:
-        # Determine chunk size for this step
-        if checkpoint_group > 0:
-            step_size = min(checkpoint_group, num_items - curr_idx)
-        else:
-            step_size = num_items # Run all at once
-            
-        end_idx = curr_idx + step_size
-        
-        carry_tup, carry_keys = to_tuple(carry)
-        
-        # Build a closure with static metadata so checkpoint only receives tensor args.
-        start = curr_idx
-        end = end_idx
-
-        def scan_chunk(*carry_tensors):
-            curr_carry = from_tuple(carry_tensors, carry_keys)
-            chunk_outputs = []
-            for i in range(start, end):
-                if isinstance(xs, dict):
-                    x_i = {k: v[i] for k, v in xs.items()}
-                else:
-                    x_i = [x[i] for x in xs]
-                curr_carry, y = f(curr_carry, x_i)
-                chunk_outputs.append(y)
-
-            stacked_out = torch.stack(chunk_outputs, dim=0)
-            new_carry_tup, _ = to_tuple(curr_carry)
-            # checkpoint expects tensor outputs; flatten carry + out in one tuple.
-            return (*new_carry_tup, stacked_out)
-
-        if checkpoint_group > 0:
-            chunk_ret = torch.utils.checkpoint.checkpoint(
-                scan_chunk,
-                *carry_tup,
-                use_reentrant=False,
-            )
-        else:
-            chunk_ret = scan_chunk(*carry_tup)
-
-        new_carry_tup = chunk_ret[:-1]
-        chunk_out = chunk_ret[-1]
-            
-        # Update carry
-        carry = from_tuple(new_carry_tup, carry_keys)
-        
-        # Collect output
-        outputs.append(chunk_out)
-        curr_idx = end_idx
-
-    # Concatenate all outputs along time dimension (dim 0 here, because we stacked locally)
-    # output shape: [seq_len, batch, ...]
-    final_output = torch.cat(outputs, dim=0)
-    return carry, final_output
-
-def grad_norm(grad, max_grad_norm=1.0):
-    """
-    Applies gradient clipping to the given gradient tensor.
-    """
-    norm = grad.norm().item()
-    if norm > max_grad_norm:
-        grad.mul_(max_grad_norm / (norm + 1e-6))
-    return grad
 
 class TitansRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        TitansRMSNorm is equivalent to T5LayerNorm
-        """
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 class TitansRotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor
-
-    def __init__(self, config: TitansConfig, device=None):
+    def __init__(self, dim: int, max_position_embeddings: int = 32768, base: float = 10000.0):
         super().__init__()
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-
-        self.rope_type = self.config.rope_parameters["rope_type"]
-        rope_init_fn: Callable = self.compute_default_rope_parameters
-        if self.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
-
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: TitansConfig | None = None,
-        device: Optional[torch.device] = None,
-        seq_len: int | None = None,
-    ) -> tuple[torch.Tensor, float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        Args:
-            config ([`~transformers.PreTrainedConfig`]):
-                The model configuration.
-            device (`torch.device`):
-                The device to use for initialization of the inverse frequencies.
-            seq_len (`int`, *optional*):
-                The current sequence length. Unused for this type of RoPE.
-        Returns:
-            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, attention_factor
 
     @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
+            cos = emb.cos()
+            sin = emb.sin()
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
-def silu_backward(x):
-    """SiLU backward function."""
-    sig = torch.sigmoid(x)
-    return sig + (F.silu(x) * (1.0 - sig))
+class TitansMLP(nn.Module):
+    def __init__(self, config: TitansConfig):
+        super().__init__()
+        self.config = config
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+class TitansDepthwiseConv1d(nn.Module):
+    def __init__(self, channels: int, kernel_size: int):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.state_size = max(kernel_size - 1, 0)
+        self.conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            groups=channels,
+            bias=True,
+            padding=kernel_size - 1,
+        )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional["TitansCache"] = None,
+        layer_idx: Optional[int] = None,
+        namespace: str = "memory",
+        name: str = "q",
+        use_cache: bool = False,
+    ) -> torch.Tensor:
+        if self.kernel_size == 1:
+            return hidden_states
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+        seq_len = hidden_states.shape[1]
+        conv_input = hidden_states.transpose(1, 2)
+        if past_key_values is not None and use_cache:
+            state = past_key_values.get_conv_state(
+                namespace,
+                name,
+                layer_idx,
+                conv_input.shape[0],
+                conv_input.shape[1],
+                self.state_size,
+                conv_input.device,
+                conv_input.dtype,
+            )
+            padded = torch.cat([state, conv_input], dim=-1)
+            out = F.conv1d(padded, self.conv.weight, self.conv.bias, padding=0, groups=self.channels)
+            past_key_values.set_conv_state(namespace, name, layer_idx, padded[..., -self.state_size :].detach())
+        else:
+            out = self.conv(conv_input)[..., :seq_len]
+        return out.transpose(1, 2)
 
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-"""
-TODO(TG): Implement TitansCache.
-NOTES:
-- Cache must store states, grads and momentum for every layer's memory module, as well as the states of the convolutions in those layers.
-- The cache structure for the attention component will differ depending on the selected variant.
-    - MAC (variant="mac"): Will need to cache the long-term memory tokens (Q vector of last segment) and the KV vectors for the *last segment only* of full causal attention.
-    It will require noting the number of chunked attention segments as well.
-    - MAG (variant="mag") and MAL (variant="mal"): Will need a KV cache for sliding-window attention rather than standard attention.
-    - LMM (variant="lmm"): No attention cache at all.
-- Dicts/attributes:
-    - conv_states: Dict[str, List[torch.Tensor]]: Stores the convolution states for each layer's convolution modules.
-"""
 
 class TitansCache:
-    pass
+    """
+    Cache for Titans inference.
 
-# Convolution.
-class TitansConv(nn.Module):
-    def __init__(self, config: TitansConfig, layer_idx: int, conv_name: str):
+    It stores the adaptive long-term memory weights and surprise momentum,
+    Q/K/V convolution states, and the short-term attention KV cache.  For the
+    attention-free `"lmm"` variant the attention key/value lists are empty to
+    avoid allocating memory for unused state.
+    """
+
+    is_compileable = False
+
+    def __init__(
+        self,
+        config: TitansConfig,
+        max_batch_size: int,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[Union[str, torch.device]] = None,
+        model: Optional["TitansModel"] = None,
+    ):
+        self.config = config
+        self.seqlen_offset = 0
+        self.dtype = dtype
+        self.max_batch_size = max_batch_size
+        self.memory_weights: list[Optional[list[torch.Tensor]]] = [None for _ in range(config.num_hidden_layers)]
+        self.memory_biases: list[Optional[list[torch.Tensor]]] = [None for _ in range(config.num_hidden_layers)]
+        self.memory_surprise_weights: list[Optional[list[torch.Tensor]]] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+        self.memory_surprise_biases: list[Optional[list[torch.Tensor]]] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+
+        if config.variant == "lmm":
+            self.key_cache: list[Optional[torch.Tensor]] = []
+            self.value_cache: list[Optional[torch.Tensor]] = []
+        else:
+            self.key_cache = [None for _ in range(config.num_hidden_layers)]
+            self.value_cache = [None for _ in range(config.num_hidden_layers)]
+
+        self.memory_conv_states = {name: [None for _ in range(config.num_hidden_layers)] for name in ("q", "k", "v")}
+        self.attention_conv_states = (
+            {}
+            if config.variant == "lmm"
+            else {name: [None for _ in range(config.num_hidden_layers)] for name in ("q", "k", "v")}
+        )
+
+        if model is not None:
+            for layer_idx, layer in enumerate(model.layers):
+                state = layer.memory.initial_state(max_batch_size, device=device, dtype=dtype)
+                self.set_memory_state(layer_idx, state, detach=True)
+
+    def __len__(self) -> int:
+        return self.config.num_hidden_layers
+
+    def get_memory_state(self, layer_idx: int) -> Optional[dict[str, list[torch.Tensor]]]:
+        weights = self.memory_weights[layer_idx]
+        if weights is None:
+            return None
+        return {
+            "weights": weights,
+            "biases": self.memory_biases[layer_idx],
+            "surprise_weights": self.memory_surprise_weights[layer_idx],
+            "surprise_biases": self.memory_surprise_biases[layer_idx],
+        }
+
+    def set_memory_state(self, layer_idx: int, state: dict[str, list[torch.Tensor]], detach: bool = True) -> None:
+        def maybe_detach(values: list[torch.Tensor]) -> list[torch.Tensor]:
+            return [value.detach() if detach else value for value in values]
+
+        self.memory_weights[layer_idx] = maybe_detach(state["weights"])
+        self.memory_biases[layer_idx] = maybe_detach(state["biases"])
+        self.memory_surprise_weights[layer_idx] = maybe_detach(state["surprise_weights"])
+        self.memory_surprise_biases[layer_idx] = maybe_detach(state["surprise_biases"])
+
+    def get_conv_state(
+        self,
+        namespace: str,
+        name: str,
+        layer_idx: int,
+        batch_size: int,
+        channels: int,
+        state_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if state_size == 0:
+            return torch.empty(batch_size, channels, 0, device=device, dtype=dtype)
+        container = self.memory_conv_states if namespace == "memory" else self.attention_conv_states
+        state = container[name][layer_idx]
+        if (
+            state is None
+            or state.shape[0] != batch_size
+            or state.shape[1] != channels
+            or state.shape[2] != state_size
+            or state.device != device
+            or state.dtype != dtype
+        ):
+            state = torch.zeros(batch_size, channels, state_size, device=device, dtype=dtype)
+            container[name][layer_idx] = state
+        return state
+
+    def set_conv_state(self, namespace: str, name: str, layer_idx: int, state: torch.Tensor) -> None:
+        container = self.memory_conv_states if namespace == "memory" else self.attention_conv_states
+        container[name][layer_idx] = state
+
+    def update_attention(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        sliding_window: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.key_cache:
+            return key_states, value_states
+        if self.key_cache[layer_idx] is None:
+            self.key_cache[layer_idx] = key_states.detach()
+            self.value_cache[layer_idx] = value_states.detach()
+        else:
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states.detach()], dim=2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states.detach()], dim=2)
+        if sliding_window is not None:
+            self.key_cache[layer_idx] = self.key_cache[layer_idx][:, :, -sliding_window:, :]
+            self.value_cache[layer_idx] = self.value_cache[layer_idx][:, :, -sliding_window:, :]
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        if not self.key_cache:
+            return 0
+        layer_idx = 0 if layer_idx is None else layer_idx
+        if self.key_cache[layer_idx] is None:
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        def reorder_tensor(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if value is None:
+                return None
+            if value.shape[0] < beam_idx.shape[0]:
+                value = value.repeat_interleave(beam_idx.shape[0] // value.shape[0], dim=0)
+            return value.index_select(0, beam_idx.to(value.device))
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            if self.key_cache:
+                self.key_cache[layer_idx] = reorder_tensor(self.key_cache[layer_idx])
+                self.value_cache[layer_idx] = reorder_tensor(self.value_cache[layer_idx])
+            for container in (self.memory_conv_states, self.attention_conv_states):
+                for states in container.values():
+                    states[layer_idx] = reorder_tensor(states[layer_idx])
+            state = self.get_memory_state(layer_idx)
+            if state is not None:
+                reordered = {key: [reorder_tensor(value) for value in values] for key, values in state.items()}
+                self.set_memory_state(layer_idx, reordered, detach=True)
+
+
+class TitansNeuralMemory(nn.Module):
+    def __init__(self, config: TitansConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = config.hidden_size // config.num_mem_heads
+        self.num_heads = config.memory_num_heads
+        self.head_dim = config.memory_head_dim
+        self.memory_width = self.num_heads * self.head_dim
+        self.chunk_size = config.memory_chunk_size
+        self.act_name = config.memory_activation
+        self.act_fn = ACT2FN[self.act_name]
 
-        # K/V convs may be smaller than hidden_size if num_kv_heads < num_attention_heads
-        if "attn" in conv_name:
-            if conv_name == "attn_q":
-                channel_size = config.hidden_size
-            else:
-                channel_size = self.head_dim * config.num_key_value_heads
+        self.q_proj = nn.Linear(config.hidden_size, self.memory_width, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.memory_width, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.memory_width, bias=False)
+        self.control_proj = nn.Linear(config.hidden_size, self.num_heads * 3, bias=True)
+        self.out_norm = TitansRMSNorm(self.memory_width, eps=config.rms_norm_eps)
+        self.gate_proj = nn.Linear(config.hidden_size, self.memory_width, bias=True)
+        self.out_proj = nn.Linear(self.memory_width, config.hidden_size, bias=False)
+
+        if config.use_memory_convolution:
+            self.q_conv = TitansDepthwiseConv1d(self.memory_width, config.memory_qkv_conv_kernel)
+            self.k_conv = TitansDepthwiseConv1d(self.memory_width, config.memory_qkv_conv_kernel)
+            self.v_conv = TitansDepthwiseConv1d(self.memory_width, config.memory_qkv_conv_kernel)
         else:
-            channel_size = config.hidden_size
+            self.q_conv = self.k_conv = self.v_conv = None
 
-        self.conv_name = conv_name
-        self.conv = nn.Conv1d(
-            in_channels=channel_size,
-            out_channels=channel_size,
-            bias=True,
-            kernel_size=config.conv_kernel,
-            groups=channel_size,
-            padding=config.conv_kernel - 1,
+        dims = [self.head_dim]
+        if config.memory_num_layers > 1:
+            dims.extend([config.memory_hidden_size for _ in range(config.memory_num_layers - 1)])
+        dims.append(self.head_dim)
+        self.memory_dims = dims
+
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        for in_dim, out_dim in zip(dims[:-1], dims[1:]):
+            self.weights.append(nn.Parameter(torch.empty(self.num_heads, in_dim, out_dim)))
+            self.biases.append(nn.Parameter(torch.zeros(self.num_heads, 1, out_dim)))
+
+    def initial_state(
+        self,
+        batch_size: int,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> dict[str, list[torch.Tensor]]:
+        dtype = self.weights[0].dtype if dtype is None else dtype
+        weights = [weight.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1, -1).clone() for weight in self.weights]
+        biases = [bias.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1, -1).clone() for bias in self.biases]
+        return {
+            "weights": weights,
+            "biases": biases,
+            "surprise_weights": [torch.zeros_like(weight) for weight in weights],
+            "surprise_biases": [torch.zeros_like(bias) for bias in biases],
+        }
+
+    def _state_from_cache_or_init(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional[TitansCache],
+    ) -> dict[str, list[torch.Tensor]]:
+        if past_key_values is not None:
+            cached = past_key_values.get_memory_state(self.layer_idx)
+            if cached is not None:
+                return cached
+        return self.initial_state(hidden_states.shape[0], hidden_states.device, hidden_states.dtype)
+
+    def _project(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+        project_query: bool = True,
+        project_update: bool = True,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = self.q_proj(hidden_states) if project_query else None
+        k = self.k_proj(hidden_states) if project_update else None
+        v = self.v_proj(hidden_states) if project_update else None
+
+        if self.q_conv is not None and project_query:
+            q = self.q_conv(q, past_key_values, self.layer_idx, "memory", "q", use_cache)
+        if self.k_conv is not None and project_update:
+            k = self.k_conv(k, past_key_values, self.layer_idx, "memory", "k", use_cache)
+            v = self.v_conv(v, past_key_values, self.layer_idx, "memory", "v", use_cache)
+
+        if q is not None:
+            q = F.silu(q).view(hidden_states.shape[0], hidden_states.shape[1], self.num_heads, self.head_dim)
+            q = l2norm(q, dim=-1, eps=self.config.l2_norm_eps).transpose(1, 2)
+        if k is not None:
+            k = F.silu(k).view(hidden_states.shape[0], hidden_states.shape[1], self.num_heads, self.head_dim)
+            k = l2norm(k, dim=-1, eps=self.config.l2_norm_eps).transpose(1, 2)
+        if v is not None:
+            v = F.silu(v).view(hidden_states.shape[0], hidden_states.shape[1], self.num_heads, self.head_dim)
+            v = v.transpose(1, 2)
+
+        controls = self.control_proj(hidden_states).view(
+            hidden_states.shape[0], hidden_states.shape[1], self.num_heads, 3
         )
+        alpha = torch.sigmoid(controls[..., 0]) * self.config.memory_alpha_scale
+        eta = torch.sigmoid(controls[..., 1]) * self.config.memory_eta_scale
+        theta = torch.sigmoid(controls[..., 2]) * self.config.memory_theta_scale
+        alpha = alpha.clamp(0.0, 1.0).transpose(1, 2)
+        eta = eta.clamp(0.0, 1.0).transpose(1, 2)
+        theta = (theta / math.sqrt(self.head_dim)).transpose(1, 2)
+        return q, k, v, theta, eta, alpha
 
-    def forward(self, hidden_states: torch.Tensor, cache: TitansCache | None = None) -> torch.Tensor:
-        # [batch_size, seq_len, num_heads, head_dim] -> [batch_size, hidden_size, seq_len]
-        bsz, seq_len, n_heads, head_dim = hidden_states.size()
+    def _mlp_forward(
+        self,
+        inputs: torch.Tensor,
+        weights: list[torch.Tensor],
+        biases: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        acts = [inputs]
+        preacts = []
+        hidden = inputs
+        for idx, (weight, bias) in enumerate(zip(weights, biases)):
+            hidden = torch.einsum("bhki,bhio->bhko", hidden, weight) + bias
+            preacts.append(hidden)
+            if idx != len(weights) - 1:
+                hidden = self.act_fn(hidden)
+            acts.append(hidden)
+        return hidden, acts, preacts
 
-        hidden_states = hidden_states.reshape(bsz, seq_len, n_heads * head_dim).transpose(1, 2)
-        if cache is not None:
-            current_conv_state = cache.conv_states[self.conv_name][self.layer_idx]
-        
-        # Copied from TTT - this probably can be optimized/cleaned up further.
-        if causal_conv1d_fn is None:
-            if cache is not None:
-                if cache.seqlen_offset > 0:
-                    new_conv_state = current_conv_state
-                    new_conv_state = torch.roll(new_conv_state, shifts=-1, dims=-1)
-                    new_conv_state[:, :, -1] = hidden_states[:, :, 0]
-                    current_conv_state.copy_(new_conv_state)
+    def _mlp_forward_dynamic(
+        self,
+        inputs: torch.Tensor,
+        weights: list[torch.Tensor],
+        biases: list[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden = inputs
+        for idx, (weight, bias) in enumerate(zip(weights, biases)):
+            hidden = torch.einsum("bhki,bhkio->bhko", hidden, weight) + bias.squeeze(-2)
+            if idx != len(weights) - 1:
+                hidden = self.act_fn(hidden)
+        return hidden
 
-                    hidden_states = torch.sum(new_conv_state * self.conv.weight[:, 0, :], dim=-1)
-                    hidden_states += self.conv.bias
-                    hidden_states = hidden_states.unsqueeze(-1)
-                else:
-                    new_conv_state = F.pad(
-                        hidden_states,
-                        (self.config.conv_kernel - hidden_states.shape[-1], 0),
-                    )
-                    current_conv_state.copy_(new_conv_state)
-            hidden_states = self.conv(hidden_states)[..., :seq_len]
-            hidden_states = F.silu(hidden_states)
-        else:
-            conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
-            if cache is not None and cache.seqlen_offset > 0:
-                hidden_states = causal_conv1d_update(
-                    hidden_states.squeeze(-1),
-                    current_conv_state,
-                    conv_weights,
-                    self.conv.bias,
-                    None,
+    def _gradients(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        weights: list[torch.Tensor],
+        biases: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        predictions, acts, preacts = self._mlp_forward(keys, weights, biases)
+        delta = (predictions - values) * self.config.memory_loss_scale
+        grad_weights: list[torch.Tensor] = [None for _ in weights]
+        grad_biases: list[torch.Tensor] = [None for _ in biases]
+
+        for idx in reversed(range(len(weights))):
+            grad_weights[idx] = torch.einsum("bhki,bhko->bhkio", acts[idx], delta)
+            grad_biases[idx] = delta.unsqueeze(-2)
+            if idx > 0:
+                delta = torch.einsum("bhko,bhio->bhki", delta, weights[idx])
+                delta = delta * _activation_grad(self.act_name, preacts[idx - 1])
+        return grad_weights, grad_biases
+
+    def _scan_affine(self, gate: torch.Tensor, value: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+        while gate.dim() < value.dim():
+            gate = gate.unsqueeze(-1)
+        gate = gate.clamp_min(self.config.parallel_scan_epsilon)
+        gate_prod = torch.cumprod(gate, dim=2)
+        return gate_prod * (initial.unsqueeze(2) + torch.cumsum(value / gate_prod, dim=2))
+
+    def _parallel_chunk(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        theta: torch.Tensor,
+        eta: torch.Tensor,
+        alpha: torch.Tensor,
+        state: dict[str, list[torch.Tensor]],
+        update: bool,
+        output_after_update: bool,
+    ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+        if not update:
+            output = self._mlp_forward(queries, state["weights"], state["biases"])[0]
+            return output, state
+
+        grad_weights, grad_biases = self._gradients(keys, values, state["weights"], state["biases"])
+        next_weights = []
+        next_biases = []
+        next_surprise_weights = []
+        next_surprise_biases = []
+        weight_sequences = []
+        bias_sequences = []
+        delta_gate = 1.0 - alpha
+
+        for weight, surprise, grad in zip(state["weights"], state["surprise_weights"], grad_weights):
+            surprise_seq = self._scan_affine(eta, -theta.unsqueeze(-1).unsqueeze(-1) * grad, surprise)
+            weight_seq = self._scan_affine(delta_gate, surprise_seq, weight)
+            next_weights.append(weight_seq[:, :, -1])
+            next_surprise_weights.append(surprise_seq[:, :, -1])
+            weight_sequences.append(weight_seq)
+
+        dynamic_weights = weight_sequences if output_after_update else [
+            weight.unsqueeze(2).expand(sample.shape[0], sample.shape[1], sample.shape[2], *weight.shape[-2:])
+            for weight, sample in zip(state["weights"], grad_weights)
+        ]
+
+        for bias, surprise, grad in zip(state["biases"], state["surprise_biases"], grad_biases):
+            surprise_seq = self._scan_affine(eta, -theta.unsqueeze(-1).unsqueeze(-1) * grad, surprise)
+            bias_seq = self._scan_affine(delta_gate, surprise_seq, bias)
+            next_biases.append(bias_seq[:, :, -1])
+            next_surprise_biases.append(surprise_seq[:, :, -1])
+            bias_sequences.append(bias_seq)
+
+        dynamic_biases = bias_sequences if output_after_update else [
+            bias.unsqueeze(2).expand(sample.shape[0], sample.shape[1], sample.shape[2], *bias.shape[-2:])
+            for bias, sample in zip(state["biases"], grad_biases)
+        ]
+
+        output = self._mlp_forward_dynamic(queries, dynamic_weights, dynamic_biases)
+        next_state = {
+            "weights": next_weights,
+            "biases": next_biases,
+            "surprise_weights": next_surprise_weights,
+            "surprise_biases": next_surprise_biases,
+        }
+        return output, next_state
+
+    def _sequential_chunk(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        theta: torch.Tensor,
+        eta: torch.Tensor,
+        alpha: torch.Tensor,
+        state: dict[str, list[torch.Tensor]],
+        update: bool,
+        output_after_update: bool,
+    ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+        outputs = []
+        cur_state = state
+        for token_idx in range(queries.shape[2]):
+            q = queries[:, :, token_idx : token_idx + 1]
+            if update:
+                grad_w, grad_b = self._gradients(
+                    keys[:, :, token_idx : token_idx + 1],
+                    values[:, :, token_idx : token_idx + 1],
+                    cur_state["weights"],
+                    cur_state["biases"],
                 )
-                hidden_states = hidden_states.unsqueeze(-1)
+                next_state = {"weights": [], "biases": [], "surprise_weights": [], "surprise_biases": []}
+                for idx in range(len(cur_state["weights"])):
+                    s_w = eta[:, :, token_idx].view(*eta.shape[:2], 1, 1) * cur_state["surprise_weights"][idx]
+                    s_w = s_w - theta[:, :, token_idx].view(*theta.shape[:2], 1, 1) * grad_w[idx].squeeze(2)
+                    w = (1.0 - alpha[:, :, token_idx]).view(*alpha.shape[:2], 1, 1) * cur_state["weights"][idx] + s_w
+                    s_b = eta[:, :, token_idx].view(*eta.shape[:2], 1, 1) * cur_state["surprise_biases"][idx]
+                    s_b = s_b - theta[:, :, token_idx].view(*theta.shape[:2], 1, 1) * grad_b[idx].squeeze(2)
+                    b = (1.0 - alpha[:, :, token_idx]).view(*alpha.shape[:2], 1, 1) * cur_state["biases"][idx] + s_b
+                    next_state["weights"].append(w)
+                    next_state["biases"].append(b)
+                    next_state["surprise_weights"].append(s_w)
+                    next_state["surprise_biases"].append(s_b)
+                if output_after_update:
+                    cur_state = next_state
+                output = self._mlp_forward(q, cur_state["weights"], cur_state["biases"])[0]
+                cur_state = next_state
             else:
-                if cache is not None:
-                    conv_states = F.pad(
-                        hidden_states,
-                        (self.config.conv_kernel - hidden_states.shape[-1], 0),
-                    )
-                    current_conv_state.copy_(conv_states)
-                hidden_states = causal_conv1d_fn(hidden_states, conv_weights, self.conv.bias, activation="silu")
+                output = self._mlp_forward(q, cur_state["weights"], cur_state["biases"])[0]
+            outputs.append(output)
+        return torch.cat(outputs, dim=2), cur_state
 
-        # [batch_size, hidden_size, seq_len] -> [batch_size, num_heads, seq_len, head_dim]
-        # TODO(TG): Optimize reshape/transposes.
-        hidden_states = hidden_states.reshape(bsz, n_heads, head_dim, seq_len).transpose(-1, -2)
-        return hidden_states
-    
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+    def retrieve(
+        self,
+        hidden_states: torch.Tensor,
+        state: dict[str, list[torch.Tensor]],
+        past_key_values: Optional[TitansCache] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
+        queries, _, _, _, _, _ = self._project(
+            hidden_states, past_key_values, use_cache, project_query=True, project_update=False
+        )
+        memory_output = self._mlp_forward(queries, state["weights"], state["biases"])[0]
+        memory_output = memory_output.transpose(1, 2).reshape(hidden_states.shape[0], hidden_states.shape[1], self.memory_width)
+        return self.out_proj(self.out_norm(memory_output))
 
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional[TitansCache] = None,
+        use_cache: bool = False,
+        state: Optional[dict[str, list[torch.Tensor]]] = None,
+        update: bool = True,
+        output_after_update: bool = True,
+        update_cache: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+        state = self._state_from_cache_or_init(hidden_states, past_key_values) if state is None else state
+        queries, keys, values, theta, eta, alpha = self._project(hidden_states, past_key_values, use_cache)
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
+        outputs = []
+        cur_state = state
+        scan_fn = self._parallel_chunk if self.config.use_parallel_memory_training else self._sequential_chunk
+        for start in range(0, hidden_states.shape[1], self.chunk_size):
+            end = min(start + self.chunk_size, hidden_states.shape[1])
+            chunk_output, cur_state = scan_fn(
+                queries[:, :, start:end],
+                keys[:, :, start:end],
+                values[:, :, start:end],
+                theta[:, :, start:end],
+                eta[:, :, start:end],
+                alpha[:, :, start:end],
+                cur_state,
+                update=update,
+                output_after_update=output_after_update,
+            )
+            outputs.append(chunk_output)
 
-    return attn_output, attn_weights
+        memory_output = torch.cat(outputs, dim=2).transpose(1, 2).reshape(
+            hidden_states.shape[0], hidden_states.shape[1], self.memory_width
+        )
+        memory_output = self.out_norm(memory_output)
+        memory_output = memory_output * F.silu(self.gate_proj(hidden_states))
+        memory_output = self.out_proj(memory_output)
+
+        if past_key_values is not None and use_cache and update_cache:
+            past_key_values.set_memory_state(self.layer_idx, cur_state, detach=True)
+        return memory_output, cur_state
+
 
 class TitansAttention(nn.Module):
     def __init__(self, config: TitansConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim ** -0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-        self.variant = config.variant
-        self.chunk_size = config.chunk_size
-        self.attention_conv = config.attention_conv
-
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
-
-        # NOTE(TG): Titans paper states they use L2 normalization for QK, but lucidrains and convention
-        # uses RMSnorm. I'm providing the option for either.
-        self.q_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else lambda x: F.normalize(x, p=2.0, dim=-1)
-        self.k_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else lambda x: F.normalize(x, p=2.0, dim=-1)
-
-        # NOTE(TG): Titans paper mentions they put convolutions on the QKV projections, but it's unclear on whether they do this to the
-        # attention layer or not as well. Providing the option for either.
-        if config.attention_conv:
-            self.conv_q = TitansConv(config, layer_idx, conv_name="attn_q")
-            self.conv_k = TitansConv(config, layer_idx, conv_name="attn_k")
-            self.conv_v = TitansConv(config, layer_idx, conv_name="attn_v")
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
-        cache: TitansCache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        past_key_values = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
-
-        if self.attention_conv:
-            # Apply convolution to QKV
-            query_states = self.conv_q(query_states, cache=cache)
-            key_states = self.conv_k(key_states, cache=cache)
-            value_states = self.conv_v(value_states, cache=cache)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-class TitansMemoryModule(nn.Module):
-    def __init__(self, config: TitansConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.num_heads = config.num_mem_heads
-        self.head_dim = config.hidden_size // config.num_mem_heads
-        self.chunk_size = config.chunk_size
-
-        # TODO(TG): No GQA support for memory module for now, nor specifying the head_dim manually.
-        self.q_proj = nn.Linear(config.hidden_size, config.num_mem_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_mem_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_mem_heads * self.head_dim, bias=False)
-
-        # NOTE(TG): Titans paper states they use L2 normalization for QK, but lucidrains and convention
-        # uses RMSnorm. I'm providing the option for either.
-        l2_norm = lambda x: F.normalize(x, p=2.0, dim=-1)
-        self.q_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else l2_norm
-        self.k_norm = TitansRMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps) if config.rms_qk_norm else l2_norm
-
-        self.conv_q = TitansConv(config, layer_idx, conv_name="mem_q")
-        self.conv_k = TitansConv(config, layer_idx, conv_name="mem_k")
-        self.conv_v = TitansConv(config, layer_idx, conv_name="mem_v")
-
-        # Gate projections to memory decay (alpha), surprise decay (eta) and learning rate (theta)
-        self.mem_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
-        self.surprise_decay_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
-        self.lr_proj = nn.Linear(config.hidden_size, config.num_mem_heads, bias=False)
-
-        mem_intermediate_size = int(self.head_dim * config.mem_expansion_factor)
-        # MLP acting as our memory module.
-        self.W1 = nn.Parameter(
-            torch.normal(
-                mean=0.0,
-                std=config.initializer_range,
-                size=(config.num_mem_heads, self.head_dim, mem_intermediate_size),
-            )
-        )
-        self.W2 = nn.Parameter(
-            torch.normal(
-                mean=0.0,
-                std=config.initializer_range,
-                size=(config.num_mem_heads, mem_intermediate_size, self.head_dim),
-            )
-        )
-        # LayerNorm for memory output.
-        self.norm_w = nn.Parameter(torch.ones(config.num_mem_heads, self.head_dim))
-        self.norm_b = nn.Parameter(torch.zeros(config.num_mem_heads, self.head_dim))
-    
-    def _reshape_pytree(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Reshaping function to prepare tensors for scan.
-        """
-        # control signals shape: [batch_size, seq_len, hidden_size]
-        # qkv shape: [batch_size, num_heads, seq_len, head_dim]
-        is_full_chunk = t.size(-2) % self.chunk_size == 0
-        if is_full_chunk:
-            if t.dim() == 3:
-                t = t.unfold(1, self.chunk_size, self.chunk_size).permute(1, 0, 3, 2)  # [num_chunks, batch_size, chunk_size, hidden_size]
-            elif t.dim() == 4:
-                t = t.unfold(2, self.chunk_size, self.chunk_size).permute(2, 0, 1, 4, 3)  # [num_chunks, batch_size, num_heads, head_dim, chunk_size]
-            else:
-                raise ValueError(f"Unexpected tensor dimension {t.dim()} during pytree reshape")
-        else:
-            t = t.unsqueeze(0)
-        return t
-
-    def chunk_forward(
-        self,
-        params_dict: dict[str, torch.Tensor],
-        inputs: dict[str, torch.Tensor]
-    ) -> tuple[dict[torch.Tensor], torch.Tensor]:
-        query_states = inputs["query_states"]
-        key_states = inputs["key_states"]
-        value_states = inputs["value_states"]
-
-        # Shape shift: [batch_size, seq_len, num_heads] -> [batch_size, num_heads, seq_len]
-        mem_decay = inputs["mem_decay"].transpose(-2, -1)
-        surprise_decay = inputs["surprise_decay"].transpose(-2, -1)
-        lr = inputs["lr"].transpose(-2, -1)
-
-        # LR scaling is required for stable training.
-        # Titans does not say how LR is scaled.
-        # Lucidrains just multiplies by 0.1 or 0.01, so we'll do 0.001; provides necessary stability
-        lr = 0.001 * lr
-
-        W1 = params_dict["W1"]
-        W2 = params_dict["W2"]
-        W1_surprise = params_dict["W1_surprise"]
-        W2_surprise = params_dict["W2_surprise"]
-        
-        # Norm which gets us to grads wrt activations.
-        ln_weight = self.norm_w.reshape(1, query_states.size(1), 1, self.head_dim)
-        ln_bias = self.norm_b.reshape(1, query_states.size(1), 1, self.head_dim)
-
-        # 1. Query retrieval from memory.
-        Q_W1 = query_states @ W1
-        Q_Z1 = F.silu(Q_W1)
-        Q_W2 = Q_Z1 @ W2
-        # layernorm
-        upd_query_states = ln_fwd(Q_W2, ln_weight, ln_bias)
-
-        # 2. Update parameter dictionary
-
-        # Keys fed through memory module
-        # Pass through memory MLP
-        Z1 = key_states @ W1  # [batch, num_heads, seq_len, mem_intermediate_size]
-        X1 = F.silu(Z1)
-        mems = X1 @ W2  # [batch, num_heads, seq_len, head_dim]
-
-        # Titans inner-loop objective is associative memory: ||M(k_t) - v_t||^2.
-        grad_wrt_mems = ln_fused_l2_bwd(mems, value_states, ln_weight, ln_bias)
-        grad_wrt_Z1 = grad_wrt_mems @ W2.transpose(-2, -1) * silu_backward(Z1)  # [batch, num_heads, seq_len, mem_intermediate_size]
-
-        c = torch.zeros_like(mem_decay)
-        e = torch.zeros_like(mem_decay)
-
-        c[..., -1] = 1.0
-        e[..., -1] = 1.0
-
-        cum_gamma = mem_decay[..., -1].clone()
-
-        for t in range(mem_decay.size(-1) - 2, -1, -1):
-            e[..., t] = e[..., t + 1] * surprise_decay[..., t + 1]
-            c[..., t] = cum_gamma + surprise_decay[..., t + 1] * c[..., t + 1]
-            cum_gamma = cum_gamma * mem_decay[..., t]
-
-        gamma_total = mem_decay.prod(dim=-1, keepdim=True)
-        eta_total = surprise_decay.prod(dim=-1, keepdim=True)
-
-        m_S0 = surprise_decay[..., 0] * c[..., 0]
-        
-        U1_lr = key_states * lr.unsqueeze(-1)
-        U2_lr = X1 * lr.unsqueeze(-1)
-
-        U1_W = U1_lr * c.unsqueeze(-1)
-        U1_S = U1_lr * e.unsqueeze(-1)
-        U2_W = U2_lr * c.unsqueeze(-1)
-        U2_S = U2_lr * e.unsqueeze(-1)
-
-        W1_grad_sum = torch.matmul(U1_W.transpose(-1, -2), grad_wrt_Z1)
-        S1_grad_sum = torch.matmul(U1_S.transpose(-1, -2), grad_wrt_Z1)
-        W2_grad_sum = torch.matmul(U2_W.transpose(-1, -2), grad_wrt_mems)
-        S2_grad_sum = torch.matmul(U2_S.transpose(-1, -2), grad_wrt_mems)
-
-        new_W1 = (gamma_total.unsqueeze(-1) * W1) + (m_S0.unsqueeze(-1).unsqueeze(-1) * W1_surprise) - W1_grad_sum
-        new_W1_surprise = (eta_total.unsqueeze(-1) * W1_surprise) - S1_grad_sum
-        new_W2 = (gamma_total.unsqueeze(-1) * W2) + (m_S0.unsqueeze(-1).unsqueeze(-1) * W2_surprise) - W2_grad_sum
-        new_W2_surprise = (eta_total.unsqueeze(-1) * W2_surprise) - S2_grad_sum
-
-        # Update params dict with new weights and surprises at end of the chunk.
-        new_params_dict = {
-            "W1": new_W1,
-            "W2": new_W2,
-            "W1_surprise": new_W1_surprise,
-            "W2_surprise": new_W2_surprise,
-        }
-        return new_params_dict, upd_query_states
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cache: TitansCache | None = None,
-    ) -> torch.Tensor:
-        """
-        Performs a retrieval step and an update step on the memory module in one go.
-        This forward function is only used for the MAL and LMM variants of Titans, with
-        the others by necessity having to need self.retrieve and self.update called separately.
-        """
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        # Project all queries, keys, values.
-        # Right now, I can't do it in a tiled manner because of the convs.
-        # TODO(TG): Add tiled conv support later.
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        query_states = self.conv_q(self.q_norm(query_states), cache=cache)
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        key_states = self.conv_k(self.k_norm(key_states), cache=cache)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
-        value_states = self.conv_v(value_states, cache=cache)
-
-        # Control signals projection.
-        mem_decay = 1.0 - torch.sigmoid(self.mem_decay_proj(hidden_states)) # (1 - alpha) in Titans paper.
-        surprise_decay = torch.sigmoid(self.surprise_decay_proj(hidden_states))
-        lr = torch.sigmoid(self.lr_proj(hidden_states))
-
-        # Split hidden states into chunks along the sequence dimension for sequential states.
-        output_hidden_states = []
-        num_full_chunks = hidden_states.size(1) // self.chunk_size
-        remainder_len = hidden_states.size(1) % self.chunk_size
-
-        # Process full chunks with sequential scan.
-        params_dict = {
-            "W1": torch.tile(self.W1.unsqueeze(0), dims=(input_shape[0], 1, 1, 1)),
-            "W2": torch.tile(self.W2.unsqueeze(0), dims=(input_shape[0], 1, 1, 1)),
-        }
-        params_dict["W1_surprise"] = torch.zeros_like(params_dict["W1"])
-        params_dict["W2_surprise"] = torch.zeros_like(params_dict["W2"])
-
-        if num_full_chunks > 0:
-            # Allocate empty output tensor.
-            full_inputs = {
-                "query_states": query_states[:, :, :num_full_chunks * self.chunk_size, :],
-                "key_states": key_states[:, :, :num_full_chunks * self.chunk_size, :],
-                "value_states": value_states[:, :, :num_full_chunks * self.chunk_size, :],
-                "mem_decay": mem_decay[:, :num_full_chunks * self.chunk_size, :],
-                "surprise_decay": surprise_decay[:, :num_full_chunks * self.chunk_size, :],
-                "lr": lr[:, :num_full_chunks * self.chunk_size, :],
-            }
-            full_inputs = tree_map(lambda x: self._reshape_pytree(x), full_inputs)
-            params_dict, output_full = sequential_scan(
-                self.chunk_forward,
-                init=params_dict,
-                xs=full_inputs,
-                checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0,
-            )
-            # Reshape output back to [batch_size, seq_len, hidden_size]
-            output_full = output_full.permute(1, 0, 2, 3, 4).reshape(input_shape[0], num_full_chunks * self.chunk_size, -1)
-            output_hidden_states.append(output_full)
-        if remainder_len > 0:
-            remainder_inputs = {
-                "query_states": query_states[:, :, -remainder_len:, :],
-                "key_states": key_states[:, :, -remainder_len:, :],
-                "value_states": value_states[:, :, -remainder_len:, :],
-                "mem_decay": mem_decay[:, -remainder_len:, :],
-                "surprise_decay": surprise_decay[:, -remainder_len:, :],
-                "lr": lr[:, -remainder_len:, :],
-            }
-            remainder_inputs = tree_map(lambda x: self._reshape_pytree(x), remainder_inputs)
-            _, output_remainder = sequential_scan(
-                self.chunk_forward,
-                init=params_dict,
-                xs=remainder_inputs,
-                checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0,
-            )
-            output_remainder = output_remainder.squeeze(0).permute(0, 2, 1, 3).reshape(input_shape[0], remainder_len, -1)
-            output_hidden_states.append(output_remainder)
-
-        output_hidden_states = torch.cat(output_hidden_states, dim=1)
-
-        return output_hidden_states
-    
-class TitansSeqModelBlock(nn.Module):
-    def __init__(self, config: TitansConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = config.hidden_size // config.num_mem_heads
-        self.variant = config.variant
-        # Temp block from unimplemented MAC
-        if self.variant == "mac":
-            raise NotImplementedError("MAC variant not implemented yet - will be done in a future update.")
-
-        self.memory = TitansMemoryModule(config, layer_idx)
-        self.self_attn = TitansAttention(config, layer_idx) if self.variant != "lmm" else None
-
-        if self.variant == "mag":
-            self.post_mem_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attn_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # Additional details about projections in the Titans memory module layer is a bit confusing
-        # between the paper and implementations. The paper mentions using a GSS (Mehta et al. 2023)
-        # style of gating with additional gate proj and an output proj. TTT uses an output proj but leaves
-        # mamba-style gating as optional. The lucidrains implementation does not use gating
-        # and only optionally includes an output projection. The related papers ATLAS and MIRAS,
-        # built on Titans by the same authors, uses gating but no output projection, only a post-norm
-        # on the memory output (Fig 2. MIRAS, Fig 3. ATLAS). But GSS - the cited arch - doesn't have a post-norm,
-        # it has a shared prenorm on the input! TTT has a post-norm but it's not optional regardless of whether you gate or not!
-        # It is a chaotic fucking mess out there, to put it bluntly. There are many more inconsistencies I haven't even mentioned here.
-        # The paper mentions gating, "normalization" (doesn't specify which), and an output projection.
-        # We will implement all of these as options. By default, I will assume post-norm, gating, and output proj.
-        # These can be turned off in the config separately if desired - it may not be worth the extra param cost.
-        # Sorry for the crashout, code reader!
-        self.use_gate = config.use_gate
-        self.use_output_proj = config.use_output_proj
-        
-        if self.use_output_proj:
-            self.o_proj = nn.Linear(config.num_mem_heads * self.head_dim, config.hidden_size, bias=False)
-        if self.use_gate:
-            self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-
-        # Persistent memory tokens.
-        self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
-        if self.num_persistent_mem_tokens > 0:
-            self.persistent_mem = nn.Parameter(
-                torch.normal(
-                    mean=0.0,
-                    std=config.initializer_range,
-                    size=(1, config.num_persistent_mem_tokens, config.hidden_size),
-                )
-            )
-        else:
-            self.persistent_mem = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        cache: TitansCache | None = None
-    ) -> torch.Tensor:
-        # NOTE(TG): This forward function will get more complex when we implement non-LMM variants with attention.
-        if self.use_gate:
-            gate_values = F.silu(self.gate_proj(hidden_states))
-
-        # Concatenate persistent memory tokens if applicable.
-        if self.persistent_mem is not None:
-            batch_size = hidden_states.size(0)
-            persistent_mem_expanded = self.persistent_mem.expand(batch_size, -1, -1)
-            hidden_states = torch.cat([persistent_mem_expanded, hidden_states], dim=1)
-
-        mem_states = self.memory(
-            hidden_states=hidden_states,
-            cache=cache
-        )
-
-        if self.variant == "mal":
-            # Feed memory output into attention - paper does this without a residual connection,
-            # will implement the option later.
-            attn_output, _ = self.self_attn(
-                mem_states,
-                position_embeddings=position_embeddings,
-                cache=cache
-            )
-            hidden_states = attn_output
-        elif self.variant == "mag":
-            # Gate memory output and attention. Paper notes that gating can be any non-linear function,
-            # we follow the paper in terms of norming both outputs and then doing GLU-style gating with SiLU.
-            attn_output, _ = self.self_attn(
-                mem_states,
-                position_embeddings=position_embeddings,
-                cache=cache
-            )
-            hidden_states = self.post_mem_layernorm(mem_states) * F.silu(self.post_attn_layernorm(attn_output))
-        elif self.variant == "lmm":
-            # Just memory, no attention.
-            hidden_states = mem_states
-        else:
-            raise ValueError(f"Unexpected variant {self.variant} in TitansSeqModelBlock. You shouldn't be seeing this.")
-
-        # Remove persistent memory tokens after attn/memory module processing.
-        if self.persistent_mem is not None:
-            hidden_states = hidden_states[:, self.num_persistent_mem_tokens:, :]
-
-        if self.use_gate:
-            # Modulate memory output with gate values.
-            hidden_states = gate_values * hidden_states
-        if self.use_output_proj:
-            hidden_states = self.o_proj(hidden_states)
-
-        return hidden_states
-
-class TitansMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-    
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.rotary_emb = TitansRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+        if config.use_attention_convolution:
+            self.q_conv = TitansDepthwiseConv1d(self.num_heads * self.head_dim, config.attention_qkv_conv_kernel)
+            self.k_conv = TitansDepthwiseConv1d(
+                self.num_key_value_heads * self.head_dim, config.attention_qkv_conv_kernel
+            )
+            self.v_conv = TitansDepthwiseConv1d(
+                self.num_key_value_heads * self.head_dim, config.attention_qkv_conv_kernel
+            )
+        else:
+            self.q_conv = self.k_conv = self.v_conv = None
+
+    def _shape_q(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(tensor.shape[0], tensor.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _shape_kv(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(tensor.shape[0], tensor.shape[1], self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    def _project_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+        if self.q_conv is not None:
+            query = self.q_conv(query, past_key_values, self.layer_idx, "attention", "q", use_cache)
+            key = self.k_conv(key, past_key_values, self.layer_idx, "attention", "k", use_cache)
+            value = self.v_conv(value, past_key_values, self.layer_idx, "attention", "v", use_cache)
+        return F.silu(query), F.silu(key), F.silu(value)
+
+    def _project_prefix(self, prefix_states: Optional[torch.Tensor]) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if prefix_states is None or prefix_states.shape[1] == 0:
+            return None, None
+        key = F.silu(self.k_proj(prefix_states))
+        value = F.silu(self.v_proj(prefix_states))
+        return self._shape_kv(key), self._shape_kv(value)
+
+    def _attention_mask(
+        self,
+        batch_size: int,
+        query_length: int,
+        key_length: int,
+        prefix_length: int,
+        past_token_length: int,
+        attention_mask: Optional[torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+        sliding_window: Optional[int],
+    ) -> torch.Tensor:
+        query_positions = torch.arange(past_token_length, past_token_length + query_length, device=device)
+        key_prefix = torch.full((prefix_length,), -1, device=device, dtype=torch.long)
+        key_tokens = torch.arange(max(past_token_length + query_length, key_length - prefix_length), device=device)
+        if key_tokens.shape[0] > key_length - prefix_length:
+            key_tokens = key_tokens[-(key_length - prefix_length) :]
+        key_positions = torch.cat([key_prefix, key_tokens], dim=0)
+        causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        prefix_allowed = key_positions.unsqueeze(0) < 0
+        allowed = causal | prefix_allowed
+        if sliding_window is not None and key_tokens.numel() > 0:
+            window_allowed = key_positions.unsqueeze(0) >= (query_positions.unsqueeze(1) - sliding_window + 1)
+            allowed = prefix_allowed | (allowed & window_allowed)
+        mask = torch.zeros(query_length, key_length, device=device, dtype=torch.float32)
+        mask = mask.masked_fill(~allowed, torch.finfo(torch.float32).min)
+        mask = mask.view(1, 1, query_length, key_length).expand(batch_size, 1, -1, -1)
+        if attention_mask is not None:
+            token_key_length = key_length - prefix_length
+            if attention_mask.shape[-1] == key_length:
+                key_mask = attention_mask
+            elif attention_mask.shape[-1] == token_key_length:
+                prefix_mask = torch.ones(batch_size, prefix_length, device=device, dtype=attention_mask.dtype)
+                key_mask = torch.cat([prefix_mask, attention_mask], dim=-1)
+            elif attention_mask.shape[-1] == query_length and token_key_length == query_length:
+                prefix_mask = torch.ones(batch_size, prefix_length, device=device, dtype=attention_mask.dtype)
+                key_mask = torch.cat([prefix_mask, attention_mask], dim=-1)
+            else:
+                token_mask = attention_mask[:, -token_key_length:]
+                if token_mask.shape[-1] < token_key_length:
+                    pad = torch.ones(
+                        batch_size,
+                        token_key_length - token_mask.shape[-1],
+                        device=device,
+                        dtype=attention_mask.dtype,
+                    )
+                    token_mask = torch.cat([pad, token_mask], dim=-1)
+                prefix_mask = torch.ones(batch_size, prefix_length, device=device, dtype=attention_mask.dtype)
+                key_mask = torch.cat([prefix_mask, token_mask], dim=-1)
+            mask = mask.masked_fill(key_mask[:, None, None, :].to(torch.bool).logical_not(), torch.finfo(torch.float32).min)
+        return mask.to(dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[TitansCache] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        prefix_states: Optional[torch.Tensor] = None,
+        sliding_window: Optional[int] = None,
+        cache_attention: bool = True,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size, query_length, _ = hidden_states.shape
+        if position_ids is None:
+            start = past_key_values.seqlen_offset if past_key_values is not None else 0
+            position_ids = torch.arange(start, start + query_length, device=hidden_states.device).unsqueeze(0)
+
+        query, key, value = self._project_tokens(hidden_states, past_key_values, use_cache and cache_attention)
+        query = self._shape_q(query)
+        key = self._shape_kv(key)
+        value = self._shape_kv(value)
+
+        cos, sin = self.rotary_emb(value, position_ids)
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        query = l2norm(query, dim=-1, eps=self.config.l2_norm_eps)
+        key = l2norm(key, dim=-1, eps=self.config.l2_norm_eps)
+
+        prefix_key, prefix_value = self._project_prefix(prefix_states)
+        prefix_length = 0 if prefix_key is None else prefix_key.shape[2]
+        if prefix_key is not None:
+            prefix_position_ids = torch.arange(prefix_length, device=hidden_states.device).unsqueeze(0)
+            prefix_cos, prefix_sin = self.rotary_emb(prefix_value, prefix_position_ids)
+            empty_query = prefix_key.new_empty(prefix_key.shape[0], self.num_key_value_heads, prefix_length, self.head_dim)
+            _, prefix_key = apply_rotary_pos_emb(empty_query, prefix_key, prefix_cos, prefix_sin)
+            prefix_key = l2norm(prefix_key, dim=-1, eps=self.config.l2_norm_eps)
+
+        past_token_length = 0
+        if past_key_values is not None and use_cache and cache_attention:
+            past_token_length = past_key_values.get_seq_length(self.layer_idx)
+            key, value = past_key_values.update_attention(key, value, self.layer_idx, sliding_window)
+            if sliding_window is not None:
+                past_token_length = max(0, key.shape[2] - query_length)
+
+        if prefix_key is not None:
+            key = torch.cat([prefix_key, key], dim=2)
+            value = torch.cat([prefix_value, value], dim=2)
+
+        key = repeat_kv(key, self.num_key_value_groups)
+        value = repeat_kv(value, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query.to(torch.float32), key.transpose(-1, -2).to(torch.float32)) * self.scaling
+        mask = self._attention_mask(
+            batch_size,
+            query_length,
+            key.shape[2],
+            prefix_length,
+            past_token_length,
+            attention_mask,
+            hidden_states.device,
+            attn_weights.dtype,
+            sliding_window,
+        )
+        attn_weights = attn_weights + mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value.dtype)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, query_length, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights if output_attentions else None
+
+
+class TitansFusionGate(nn.Module):
+    def __init__(self, config: TitansConfig):
+        super().__init__()
+        self.memory_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.core_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.gate_proj = nn.Linear(config.hidden_size * 3, config.hidden_size, bias=True)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.gate_bias = config.gate_bias
+
+    def forward(self, core: torch.Tensor, memory: torch.Tensor, residual_input: torch.Tensor) -> torch.Tensor:
+        core_n = self.core_norm(core)
+        memory_n = self.memory_norm(memory)
+        gate = torch.sigmoid(self.gate_proj(torch.cat([core_n, memory_n, residual_input], dim=-1)) + self.gate_bias)
+        return self.out_proj(gate * core_n + (1.0 - gate) * memory_n)
+
+
 class TitansDecoderLayer(nn.Module):
     def __init__(self, config: TitansConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-
-        self.seq_model_block = TitansSeqModelBlock(config, layer_idx)
+        self.variant = config.variant
+        self.memory = TitansNeuralMemory(config, layer_idx)
+        self.self_attn = None if self.variant == "lmm" else TitansAttention(config, layer_idx)
+        self.fusion = None if self.variant in ["lmm", "mal"] else TitansFusionGate(config)
+        self.memory_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = TitansMLP(config)
+        self.resid_dropout = nn.Dropout(config.resid_dropout)
+        if config.persistent_memory_tokens > 0:
+            self.persistent_memory = nn.Parameter(torch.empty(config.persistent_memory_tokens, config.hidden_size))
+        else:
+            self.persistent_memory = None
 
-        self.input_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_seq_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.head_dim = config.hidden_size // config.num_mem_heads
+    def _persistent(self, batch_size: int, dtype: torch.dtype, device: torch.device) -> Optional[torch.Tensor]:
+        if self.persistent_memory is None:
+            return None
+        return self.persistent_memory.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _with_persistent(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, int]:
+        persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
+        if persistent is None:
+            return hidden_states, 0
+        return torch.cat([persistent, hidden_states], dim=1), persistent.shape[1]
+
+    def _forward_lmm(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        residual = hidden_states
+        memory_input = self.memory_norm(hidden_states)
+        memory_input, prefix_len = self._with_persistent(memory_input)
+        memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
+        memory_output = memory_output[:, prefix_len:]
+        hidden_states = residual + self.resid_dropout(memory_output)
+        return hidden_states, None
+
+    def _forward_mal(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+        output_attentions: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        residual = hidden_states
+        memory_input = self.memory_norm(hidden_states)
+        memory_input, prefix_len = self._with_persistent(memory_input)
+        memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
+        memory_output = memory_output[:, prefix_len:]
+        hidden_states = residual + self.resid_dropout(memory_output)
+
+        residual = hidden_states
+        attn_input = self.attn_norm(hidden_states)
+        attn_output, attn_weights = self.self_attn(
+            attn_input,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            sliding_window=self.config.sliding_window,
+        )
+        hidden_states = residual + self.resid_dropout(attn_output)
+        return hidden_states, attn_weights
+
+    def _forward_mag(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+        output_attentions: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        residual = hidden_states
+        branch_input = self.attn_norm(hidden_states)
+        persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
+        attn_output, attn_weights = self.self_attn(
+            branch_input,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            prefix_states=persistent,
+            sliding_window=self.config.sliding_window,
+        )
+        memory_input, prefix_len = self._with_persistent(branch_input)
+        memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
+        memory_output = memory_output[:, prefix_len:]
+        hidden_states = residual + self.resid_dropout(self.fusion(attn_output, memory_output, branch_input))
+        return hidden_states, attn_weights
+
+    def _forward_mac(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+        output_attentions: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        residual = hidden_states
+        memory_input = self.memory_norm(hidden_states)
+        state = self.memory._state_from_cache_or_init(memory_input, past_key_values)
+        local_attention_mask = attention_mask
+        if local_attention_mask is not None and local_attention_mask.shape[-1] != hidden_states.shape[1]:
+            local_attention_mask = local_attention_mask[:, -hidden_states.shape[1] :]
+        outputs = []
+        attn_collection = [] if output_attentions else None
+        segment_size = self.config.mac_segment_size
+        persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
+
+        for start in range(0, hidden_states.shape[1], segment_size):
+            end = min(start + segment_size, hidden_states.shape[1])
+            segment = memory_input[:, start:end]
+            segment_mask = local_attention_mask[:, start:end] if local_attention_mask is not None else None
+            segment_pos = position_ids[:, start:end] if position_ids is not None else None
+            historical = self.memory.retrieve(segment, state, past_key_values=past_key_values, use_cache=use_cache)
+            prefix = historical if persistent is None else torch.cat([persistent, historical], dim=1)
+            attn_output, attn_weights = self.self_attn(
+                segment,
+                attention_mask=segment_mask,
+                position_ids=segment_pos,
+                past_key_values=past_key_values,
+                use_cache=False,
+                output_attentions=output_attentions,
+                prefix_states=prefix,
+                sliding_window=None,
+                cache_attention=False,
+            )
+            memory_output, state = self.memory(
+                attn_output,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                state=state,
+                update=True,
+                output_after_update=True,
+                update_cache=False,
+            )
+            outputs.append(self.fusion(attn_output, memory_output, segment))
+            if output_attentions:
+                attn_collection.append(attn_weights)
+
+        if past_key_values is not None and use_cache:
+            past_key_values.set_memory_state(self.layer_idx, state, detach=True)
+        hidden_states = residual + self.resid_dropout(torch.cat(outputs, dim=1))
+        if output_attentions:
+            return hidden_states, tuple(attn_collection)
+        return hidden_states, None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        cache: TitansCache | None = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[TitansCache] = None,
         use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.variant == "lmm":
+            hidden_states, attn_weights = self._forward_lmm(hidden_states, past_key_values, use_cache)
+        elif self.variant == "mal":
+            hidden_states, attn_weights = self._forward_mal(
+                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions
+            )
+        elif self.variant == "mag":
+            hidden_states, attn_weights = self._forward_mag(
+                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions
+            )
+        elif self.variant == "mac":
+            hidden_states, attn_weights = self._forward_mac(
+                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions
+            )
+        else:  # pragma: no cover - config validation prevents this.
+            raise ValueError(f"Unsupported Titans variant {self.variant!r}.")
 
-        hidden_states = self.seq_model_block(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            cache=cache
-        )
-        hidden_states = residual + hidden_states
-
-        # MLP block
         residual = hidden_states
-        hidden_states = self.post_seq_layernorm(hidden_states)
+        hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        
-        return hidden_states
-    
+        hidden_states = residual + self.resid_dropout(hidden_states)
+        return hidden_states, attn_weights
+
+
 class TitansPreTrainedModel(PreTrainedModel):
-    config: TitansConfig
+    config_class = TitansConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["TitansDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
+    _supports_cache_class = True
 
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": TitansDecoderLayer,
-    }
+    def _init_weights(self, module: nn.Module) -> None:
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
+                init.zeros_(module.weight[module.padding_idx])
+        elif isinstance(module, TitansNeuralMemory):
+            for weight in module.weights:
+                init.normal_(weight, mean=0.0, std=std)
+            for bias in module.biases:
+                init.zeros_(bias)
+            if module.control_proj.bias is not None and not getattr(
+                module.control_proj.bias, "_is_hf_initialized", False
+            ):
+                with torch.no_grad():
+                    control_bias = module.control_proj.bias.view(module.num_heads, 3)
+                    control_bias[:, 0].fill_(self.config.memory_alpha_bias)
+                    control_bias[:, 1].fill_(self.config.memory_eta_bias)
+                    control_bias[:, 2].fill_(self.config.memory_theta_bias)
+        elif isinstance(module, TitansDecoderLayer) and module.persistent_memory is not None:
+            init.normal_(module.persistent_memory, mean=0.0, std=std)
+
+
+@dataclass
+class TitansModelOutputWithPast(ModelOutput):
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[TitansCache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[Any, ...]] = None
+
 
 class TitansModel(TitansPreTrainedModel):
     def __init__(self, config: TitansConfig):
         super().__init__(config)
-        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.num_persistent_mem_tokens = config.num_persistent_mem_tokens
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
-        self.layers = nn.ModuleList(
-            [TitansDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
-        )
-        self.final_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = TitansRotaryEmbedding(config=config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([TitansDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        cache: TitansCache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[TitansCache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_params: Optional[TitansCache] = None,
+    ) -> Union[tuple, TitansModelOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
-        if use_cache and cache is None:
-            # TODO(TG): Implement cache later.
+        if cache_params is not None and past_key_values is None:
+            past_key_values = cache_params
+
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
+
+        if self.training and use_cache:
+            use_cache = False
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
             use_cache = False
 
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        batch_size, seq_len, _ = inputs_embeds.shape
+
+        if use_cache and past_key_values is None:
+            past_key_values = TitansCache(
+                self.config,
+                batch_size,
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+                model=self,
+            )
+
+        past_seen_tokens = past_key_values.seqlen_offset if past_key_values is not None else 0
+        if position_ids is None:
+            position_ids = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + seq_len,
+                dtype=torch.long,
+                device=inputs_embeds.device,
+            ).unsqueeze(0).expand(batch_size, -1)
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                batch_size, past_seen_tokens + seq_len, dtype=torch.long, device=inputs_embeds.device
+            )
+
         hidden_states = inputs_embeds
-        position_ids = torch.arange(0, hidden_states.size(1) + self.num_persistent_mem_tokens, device=hidden_states.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cache=cache,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        hidden_states = self.final_norm(hidden_states)
-        return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=None)
-    
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            if self.gradient_checkpointing and self.training:
+                hidden_states, attn_weights = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    None,
+                    False,
+                    output_attentions,
+                )
+            else:
+                hidden_states, attn_weights = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
+            if output_attentions:
+                all_attentions += (attn_weights,)
+
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        if use_cache and past_key_values is not None:
+            past_key_values.seqlen_offset += seq_len
+
+        if not return_dict:
+            return tuple(v for v in (hidden_states, past_key_values if use_cache else None, all_hidden_states, all_attentions) if v is not None)
+        return TitansModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+        )
+
+
 class TitansForCausalLM(TitansPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        return False
 
     def __init__(self, config: TitansConfig):
         super().__init__(config)
         self.model = TitansModel(config)
+        self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values: Optional[TitansCache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+        model_inputs.update(
+            {
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache", True),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    def _update_model_kwargs_for_generation(self, outputs: ModelOutput, model_kwargs: dict[str, Any], **kwargs):
+        model_kwargs["past_key_values"] = outputs.past_key_values
+        if "attention_mask" in model_kwargs and model_kwargs["attention_mask"] is not None:
+            attention_mask = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+        return model_kwargs
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        cache: TitansCache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[TitansCache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_params: Optional[TitansCache] = None,
+    ) -> Union[tuple, CausalLMOutputWithPast]:
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            cache=cache,
+            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_params=cache_params,
         )
-
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states).float()
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1).to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
 
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -1072,3 +1319,14 @@ class TitansForCausalLM(TitansPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+__all__ = [
+    "TitansCache",
+    "TitansConfig",
+    "TitansForCausalLM",
+    "TitansModel",
+    "TitansModelOutputWithPast",
+    "TitansPreTrainedModel",
+    "l2norm",
+]
