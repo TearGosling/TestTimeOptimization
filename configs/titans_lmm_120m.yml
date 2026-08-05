@@ -30,7 +30,7 @@ training_args:
   output_dir: "./checkpoints/titans_lmm_120m"
   num_train_epochs: 1
   report_to: "wandb"
-  resume_from_checkpoint: "./checkpoints/checkpoints/titans_lmm_120m/checkpoint-3000"
+  resume_from_checkpoint: null
   save_steps: 1000
   save_total_limit: 3
   seed: 80085
