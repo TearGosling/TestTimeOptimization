@@ -63,6 +63,8 @@ class TitansConfig(PreTrainedConfig):
             Expansion factor used when `memory_hidden_size` is not supplied.
         memory_chunk_size (`int`, *optional*, defaults to 16):
             Chunk size used by the paper's parallel inner-loop training rule.
+        memory_residual (`bool`, *optional*, defaults to `True`):
+            Whether to use a residual connection in the memory MLP.
         mac_segment_size (`int`, *optional*):
             Segment size used by Memory as a Context. Defaults to
             `memory_chunk_size`.
@@ -117,6 +119,7 @@ class TitansConfig(PreTrainedConfig):
         memory_mlp_expansion: int = 4,
         memory_activation: str = "silu",
         memory_chunk_size: int = 16,
+        memory_residual: bool = True,
         mac_segment_size: int | None = None,
         persistent_memory_tokens: int = 4,
         sliding_window: int | None = 256,
@@ -154,7 +157,7 @@ class TitansConfig(PreTrainedConfig):
         self.attention_dropout = attention_dropout
         self.resid_dropout = resid_dropout
 
-        self.variant = variant.lower()
+        self.variant = variant.lower().strip()
         self.memory_num_heads = num_attention_heads if memory_num_heads is None else memory_num_heads
         self.memory_head_dim = hidden_size // self.memory_num_heads if memory_head_dim is None else memory_head_dim
         self.memory_num_layers = memory_num_layers
@@ -164,6 +167,7 @@ class TitansConfig(PreTrainedConfig):
         )
         self.memory_activation = memory_activation
         self.memory_chunk_size = memory_chunk_size
+        self.memory_residual = memory_residual
         self.mac_segment_size = memory_chunk_size if mac_segment_size is None else mac_segment_size
         self.persistent_memory_tokens = persistent_memory_tokens
         self.sliding_window = sliding_window

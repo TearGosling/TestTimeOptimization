@@ -449,6 +449,9 @@ class TitansNeuralMemory(nn.Module):
             if idx != len(weights) - 1:
                 hidden = self.act_fn(hidden)
             acts.append(hidden)
+        if self.config.memory_residual:
+            hidden = inputs + hidden
+            
         return hidden, acts, preacts
 
     def _mlp_forward_dynamic(
@@ -462,6 +465,8 @@ class TitansNeuralMemory(nn.Module):
             hidden = torch.einsum("bhki,bhkio->bhko", hidden, weight) + bias.squeeze(-2)
             if idx != len(weights) - 1:
                 hidden = self.act_fn(hidden)
+        if self.config.memory_residual:
+            hidden = inputs + hidden
         return hidden
 
     def _gradients(
