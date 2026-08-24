@@ -1,5 +1,4 @@
 accelerate
-causal-conv1d
 datasets
 liger-kernel
 pyyaml

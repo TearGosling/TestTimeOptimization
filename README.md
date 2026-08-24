@@ -67,10 +67,16 @@ options:
 
 # Training
 
-Use `train.py` to train a model using a config. The script is extremely basic for now; the Hugging Face `Trainer` class is used to train the models and the script supports single-GPU only.
+Use `train.py` to train a model using a config. The script is extremely basic for now; more features will be added later.
 
+For single GPU:
 ```
 python3 train.py <PATH_TO_CONFIG_FILE>
+```
+
+For multi-GPU, it's recommended to use the `accelerate` library:
+```
+accelerate launch train.py <PATH_TO_CONFIG_FILE>
 ```
 
 The config must be in a YAML file with the following structure:
@@ -103,7 +109,7 @@ training_args:
   report_to: "wandb"
 ```
 
-As an example for a pre-training run, refer to `configs/titans_lmm_120m.yml`. It will fit onto an RTX 3090. This repo is not yet meant to be for production-ready runs, but rather for now acting as a demonstration. By default, it will save models to a `checkpoint` directory inside the repo folder. Change this as you wish.
+As an example for a pre-training run, refer to `configs/titans_lmm_120m.yml`. It will fit onto a single RTX 3090. This repo is not yet meant to be for production-ready runs, but rather for now acting as a demonstration. By default, it will save models to a `checkpoint` directory inside the repo folder. Change this as you wish.
 
 ---
 
@@ -111,6 +117,8 @@ As an example for a pre-training run, refer to `configs/titans_lmm_120m.yml`. It
 
 Various other things besides architectures themselves I have to implement, eventually (in no particular order):
 
+- [ ] Add more variants of attention
+- [ ] [Liger Kernel](https://github.com/linkedin/Liger-Kernel) support.
 - [ ] Add proper parallel associative scan implementation
 - [ ] Reduce redundancy by creating a common utils file
 - [ ] Add custom Triton kernels

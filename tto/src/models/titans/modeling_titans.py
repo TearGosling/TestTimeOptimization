@@ -365,7 +365,9 @@ class TitansNeuralMemory(nn.Module):
         self.weights = nn.ParameterList()
         self.biases = nn.ParameterList()
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
-            self.weights.append(nn.Parameter(torch.empty(self.num_heads, in_dim, out_dim)))
+            # Used to be torch.empty but there's some sort of weird initialization bug
+            # where the weights never actually get filled. Hacky fix until I figure it out.
+            self.weights.append(nn.Parameter(torch.randn(self.num_heads, in_dim, out_dim) * self.config.initializer_range))
             self.biases.append(nn.Parameter(torch.zeros(self.num_heads, 1, out_dim)))
 
     def initial_state(
@@ -866,7 +868,7 @@ class TitansDecoderLayer(nn.Module):
         self.self_attn = None if self.variant == "lmm" else TitansAttention(config, layer_idx)
         self.fusion = None if self.variant in ["lmm", "mal"] else TitansFusionGate(config)
         self.memory_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = None if self.variant == "lmm" else TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = TitansMLP(config)
         self.resid_dropout = nn.Dropout(config.resid_dropout)
