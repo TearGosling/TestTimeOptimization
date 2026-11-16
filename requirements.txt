@@ -2,6 +2,6 @@ accelerate
 datasets
 liger-kernel
 pyyaml
-transformers>=5.3.0
+transformers[kernels]>=5.23.0
 torch>=2.6.0
 wandb

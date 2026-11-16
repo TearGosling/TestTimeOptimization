@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from transformers.configuration_utils import PreTrainedConfig
+from transformers.modeling_rope_utils import RopeParameters
 
 
 class TitansConfig(PreTrainedConfig):
@@ -45,6 +46,10 @@ class TitansConfig(PreTrainedConfig):
         num_key_value_heads (`int`, *optional*):
             Number of key/value heads for grouped-query attention. Defaults to
             `num_attention_heads`.
+        rope_parameters (`RopeParameters` or `dict`, *optional*):
+            Standard Hugging Face RoPE parameters for short-term attention.
+            Legacy `rope_theta` and `rope_scaling` inputs are converted by
+            `PreTrainedConfig`. Neural memory does not use RoPE.
         variant (`str`, *optional*, defaults to `"mac"`):
             Titans variant. One of `"lmm"`, `"mac"`, `"mag"`, or `"mal"`.
         memory_num_heads (`int`, *optional*):
@@ -109,6 +114,7 @@ class TitansConfig(PreTrainedConfig):
         tie_word_embeddings: bool = True,
         pretraining_tp: int = 1,
         rope_theta: float = 10000.0,
+        rope_parameters: RopeParameters | dict | None = None,
         attention_dropout: float = 0.0,
         resid_dropout: float = 0.0,
         variant: str = "mac",
@@ -137,7 +143,6 @@ class TitansConfig(PreTrainedConfig):
         memory_loss_scale: float | None = None,
         l2_norm_eps: float = 1e-6,
         use_parallel_memory_training: bool = True,
-        parallel_scan_epsilon: float = 1e-6,
         gate_bias: float = 0.0,
         **kwargs,
     ):
@@ -147,18 +152,22 @@ class TitansConfig(PreTrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_attention_heads if num_key_value_heads is None else num_key_value_heads
+        if self.num_attention_heads <= 0 or self.num_key_value_heads <= 0:
+            raise ValueError("`num_attention_heads` and `num_key_value_heads` must be positive.")
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.pretraining_tp = pretraining_tp
-        self.rope_theta = rope_theta
+        self.rope_parameters = dict(rope_parameters) if rope_parameters is not None else None
         self.attention_dropout = attention_dropout
         self.resid_dropout = resid_dropout
 
         self.variant = variant.lower().strip()
         self.memory_num_heads = num_attention_heads if memory_num_heads is None else memory_num_heads
+        if self.memory_num_heads <= 0:
+            raise ValueError("`memory_num_heads` must be positive.")
         self.memory_head_dim = hidden_size // self.memory_num_heads if memory_head_dim is None else memory_head_dim
         self.memory_num_layers = memory_num_layers
         self.memory_mlp_expansion = memory_mlp_expansion
@@ -189,31 +198,46 @@ class TitansConfig(PreTrainedConfig):
         self.memory_loss_scale = 1.0 / self.memory_head_dim if memory_loss_scale is None else memory_loss_scale
         self.l2_norm_eps = l2_norm_eps
         self.use_parallel_memory_training = use_parallel_memory_training
-        self.parallel_scan_epsilon = parallel_scan_epsilon
         self.gate_bias = gate_bias
 
         self._validate()
+        head_dim = self.hidden_size // self.num_attention_heads
+        supplied_head_dim = kwargs.pop("head_dim", None)
+        if supplied_head_dim is not None and supplied_head_dim != head_dim:
+            raise ValueError("`head_dim` must equal `hidden_size // num_attention_heads`.")
 
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            rope_theta=rope_theta,
             **kwargs,
         )
+        if self.variant != "lmm":
+            partial_rotary_factor = self.rope_parameters.get("partial_rotary_factor", 1.0)
+            rotary_dim = int(head_dim * partial_rotary_factor)
+            if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
+                raise ValueError("The rotary dimension must be positive, even and no larger than the attention head.")
 
     def _validate(self) -> None:
         variants = {"lmm", "mac", "mag", "mal"}
+        if min(self.vocab_size, self.hidden_size, self.intermediate_size, self.num_hidden_layers) <= 0:
+            raise ValueError("Vocabulary, hidden, intermediate and layer dimensions must be positive.")
         if self.variant not in variants:
             raise ValueError(f"`variant` must be one of {sorted(variants)}, got {self.variant!r}.")
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError("`hidden_size` must be divisible by `num_attention_heads`.")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError("`num_attention_heads` must be divisible by `num_key_value_heads`.")
+        if self.variant != "lmm" and (self.hidden_size // self.num_attention_heads) % 2:
+            raise ValueError("Short-term attention requires an even RoPE head dimension.")
         if self.memory_num_heads <= 0 or self.memory_head_dim <= 0:
             raise ValueError("`memory_num_heads` and `memory_head_dim` must be positive.")
         if self.memory_num_layers < 1:
             raise ValueError("`memory_num_layers` must be at least 1.")
+        if self.memory_hidden_size <= 0:
+            raise ValueError("`memory_hidden_size` must be positive.")
         if self.memory_chunk_size < 1:
             raise ValueError("`memory_chunk_size` must be at least 1.")
         if self.mac_segment_size < 1:

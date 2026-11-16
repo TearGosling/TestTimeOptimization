@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import CrossEntropyLoss
 from transformers import initialization as init
 
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
+from transformers.masking_utils import flash_attention_mask
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, logging
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_logits_to_keep
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, ModelOutput, logging
+from transformers.utils.generic import is_flash_attention_requested
 
 try:
     from .configuration_titans import TitansConfig
@@ -27,8 +34,10 @@ logger = logging.get_logger(__name__)
 
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
     """This function is intended to align with the l2norm implementation in the FLA library."""
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x * inv_norm
+    return (x * inv_norm).to(input_dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -46,7 +55,14 @@ def apply_rotary_pos_emb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    q_rot, k_rot = q[..., :rotary_dim], k[..., :rotary_dim]
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    if rotary_dim != q.shape[-1]:
+        q_embed = torch.cat([q_embed, q[..., rotary_dim:]], dim=-1)
+        k_embed = torch.cat([k_embed, k[..., rotary_dim:]], dim=-1)
+    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -57,16 +73,35 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
 
 
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = repeat_kv(key, module.num_key_value_groups)
+    value = repeat_kv(value, module.num_key_value_groups)
+    weights = torch.matmul(query.float(), key.transpose(-1, -2).float()) * scaling
+    if attention_mask is not None:
+        weights = weights + attention_mask
+    weights = F.softmax(weights, dim=-1, dtype=torch.float32).to(value.dtype)
+    weights = F.dropout(weights, p=dropout, training=module.training)
+    output = torch.matmul(weights, value).transpose(1, 2).contiguous()
+    return output, weights
+
+
 def _activation_grad(name: str, x: torch.Tensor) -> torch.Tensor:
     name = name.lower()
     if name in {"silu", "swish"}:
         sig = torch.sigmoid(x)
         return sig * (1.0 + x * (1.0 - sig))
     if name == "gelu":
-        # Approximate GELU
-        tanh_out = torch.tanh(0.79788456 * x * (1.0 + 0.044715 * x * x))
-        return 0.5 * (1.0 + tanh_out) + 0.5 * x * (1.0 - tanh_out * tanh_out) * (
-            0.79788456 + 0.1070322243 * x * x
+        return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0))) + x * torch.exp(-0.5 * x * x) / math.sqrt(
+            2.0 * math.pi
         )
     if name == "relu":
         return (x > 0).to(dtype=x.dtype)
@@ -91,26 +126,31 @@ class TitansRMSNorm(nn.Module):
 
 
 class TitansRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: int = 32768, base: float = 10000.0):
+    def __init__(self, config: TitansConfig):
         super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+        self.config = config
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.rope_type = config.rope_parameters["rope_type"]
+        rope_init_fn = self.compute_default_rope_parameters if self.rope_type == "default" else ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(config)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    def compute_default_rope_parameters(config: TitansConfig, **kwargs) -> tuple[torch.Tensor, float]:
+        dim = config.hidden_size // config.num_attention_heads
+        dim = int(dim * config.rope_parameters.get("partial_rotary_factor", 1.0))
+        base = config.rope_parameters["rope_theta"]
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        return inv_freq, 1.0
 
     @torch.no_grad()
+    @dynamic_rope_update
     def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        freqs = position_ids[..., None].float() * self.inv_freq.to(device=x.device, dtype=torch.float32)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return (emb.cos() * self.attention_scaling).to(x.dtype), (emb.sin() * self.attention_scaling).to(x.dtype)
 
 
 class TitansMLP(nn.Module):
@@ -168,7 +208,7 @@ class TitansDepthwiseConv1d(nn.Module):
             )
             padded = torch.cat([state, conv_input], dim=-1)
             out = F.conv1d(padded, self.conv.weight, self.conv.bias, padding=0, groups=self.channels)
-            past_key_values.set_conv_state(namespace, name, layer_idx, padded[..., -self.state_size :].detach())
+            past_key_values.set_conv_state(namespace, name, layer_idx, padded[..., -self.state_size :].detach().clone())
         else:
             out = self.conv(conv_input)[..., :seq_len]
         return out.transpose(1, 2)
@@ -198,12 +238,25 @@ class TitansCache:
         self.seqlen_offset = 0
         self.dtype = dtype
         self.max_batch_size = max_batch_size
+        self.batch_caches: Optional[list[Optional["TitansCache"]]] = None
         self.memory_weights: list[Optional[list[torch.Tensor]]] = [None for _ in range(config.num_hidden_layers)]
         self.memory_biases: list[Optional[list[torch.Tensor]]] = [None for _ in range(config.num_hidden_layers)]
         self.memory_surprise_weights: list[Optional[list[torch.Tensor]]] = [
             None for _ in range(config.num_hidden_layers)
         ]
         self.memory_surprise_biases: list[Optional[list[torch.Tensor]]] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+        self.memory_chunk_states: list[Optional[dict[str, list[torch.Tensor]]]] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+        self.memory_chunk_inputs: list[Optional[tuple[torch.Tensor, ...]]] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+        self.mac_segment_states: list[Optional[dict[str, list[torch.Tensor]]]] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+        self.mac_segment_inputs: list[Optional[tuple[torch.Tensor, ...]]] = [
             None for _ in range(config.num_hidden_layers)
         ]
 
@@ -295,25 +348,41 @@ class TitansCache:
         else:
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states.detach()], dim=2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states.detach()], dim=2)
+        key_states, value_states = self.key_cache[layer_idx], self.value_cache[layer_idx]
         if sliding_window is not None:
-            self.key_cache[layer_idx] = self.key_cache[layer_idx][:, :, -sliding_window:, :]
-            self.value_cache[layer_idx] = self.value_cache[layer_idx][:, :, -sliding_window:, :]
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+            self.key_cache[layer_idx] = key_states[:, :, -sliding_window:, :].clone()
+            self.value_cache[layer_idx] = value_states[:, :, -sliding_window:, :].clone()
+        # Early queries still need their own window, not just the last query's.
+        return key_states, value_states
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        if not self.key_cache:
-            return 0
-        layer_idx = 0 if layer_idx is None else layer_idx
-        if self.key_cache[layer_idx] is None:
-            return 0
-        return self.key_cache[layer_idx].shape[-2]
+        return self.seqlen_offset
+
+    def _select_batch(self, indices: torch.LongTensor) -> "TitansCache":
+        selected = copy(self)
+        for name in (
+            "memory_weights", "memory_biases", "memory_surprise_weights", "memory_surprise_biases",
+            "memory_chunk_states", "memory_chunk_inputs", "mac_segment_states", "mac_segment_inputs",
+            "key_cache", "value_cache",
+        ):
+            setattr(selected, name, getattr(self, name).copy())
+        selected.memory_conv_states = {name: states.copy() for name, states in self.memory_conv_states.items()}
+        selected.attention_conv_states = {name: states.copy() for name, states in self.attention_conv_states.items()}
+        selected.reorder_cache(indices)
+        return selected
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        self.max_batch_size = beam_idx.numel()
+        if self.batch_caches is not None:
+            self.batch_caches = [
+                self.batch_caches[index]._select_batch(beam_idx.new_zeros(1))
+                if self.batch_caches[index] is not None else None
+                for index in beam_idx.tolist()
+            ]
+            return
         def reorder_tensor(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if value is None:
                 return None
-            if value.shape[0] < beam_idx.shape[0]:
-                value = value.repeat_interleave(beam_idx.shape[0] // value.shape[0], dim=0)
             return value.index_select(0, beam_idx.to(value.device))
 
         for layer_idx in range(self.config.num_hidden_layers):
@@ -327,6 +396,13 @@ class TitansCache:
             if state is not None:
                 reordered = {key: [reorder_tensor(value) for value in values] for key, values in state.items()}
                 self.set_memory_state(layer_idx, reordered, detach=True)
+            for states in (self.memory_chunk_states, self.mac_segment_states):
+                state = states[layer_idx]
+                if state is not None:
+                    states[layer_idx] = {key: [reorder_tensor(value) for value in values] for key, values in state.items()}
+            for inputs in (self.memory_chunk_inputs, self.mac_segment_inputs):
+                if inputs[layer_idx] is not None:
+                    inputs[layer_idx] = tuple(reorder_tensor(value) for value in inputs[layer_idx])
 
 
 class TitansNeuralMemory(nn.Module):
@@ -365,7 +441,7 @@ class TitansNeuralMemory(nn.Module):
         self.weights = nn.ParameterList()
         self.biases = nn.ParameterList()
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
-            # Used to be torch.empty but there's some sort of weird initialization bug
+            # Used to be torch.empty for self.weights but there's some sort of weird initialization bug
             # where the weights never actually get filled. Hacky fix until I figure it out.
             self.weights.append(nn.Parameter(torch.randn(self.num_heads, in_dim, out_dim) * self.config.initializer_range))
             self.biases.append(nn.Parameter(torch.zeros(self.num_heads, 1, out_dim)))
@@ -456,22 +532,7 @@ class TitansNeuralMemory(nn.Module):
             
         return hidden, acts, preacts
 
-    def _mlp_forward_dynamic(
-        self,
-        inputs: torch.Tensor,
-        weights: list[torch.Tensor],
-        biases: list[torch.Tensor],
-    ) -> torch.Tensor:
-        hidden = inputs
-        for idx, (weight, bias) in enumerate(zip(weights, biases)):
-            hidden = torch.einsum("bhki,bhkio->bhko", hidden, weight) + bias.squeeze(-2)
-            if idx != len(weights) - 1:
-                hidden = self.act_fn(hidden)
-        if self.config.memory_residual:
-            hidden = inputs + hidden
-        return hidden
-
-    def _gradients(
+    def _gradient_factors(
         self,
         keys: torch.Tensor,
         values: torch.Tensor,
@@ -480,23 +541,41 @@ class TitansNeuralMemory(nn.Module):
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         predictions, acts, preacts = self._mlp_forward(keys, weights, biases)
         delta = (predictions - values) * self.config.memory_loss_scale
-        grad_weights: list[torch.Tensor] = [None for _ in weights]
-        grad_biases: list[torch.Tensor] = [None for _ in biases]
-
+        deltas: list[torch.Tensor] = [None for _ in weights]
         for idx in reversed(range(len(weights))):
-            grad_weights[idx] = torch.einsum("bhki,bhko->bhkio", acts[idx], delta)
-            grad_biases[idx] = delta.unsqueeze(-2)
+            deltas[idx] = delta
             if idx > 0:
                 delta = torch.einsum("bhko,bhio->bhki", delta, weights[idx])
                 delta = delta * _activation_grad(self.act_name, preacts[idx - 1])
-        return grad_weights, grad_biases
+        return acts, deltas
 
-    def _scan_affine(self, gate: torch.Tensor, value: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-        while gate.dim() < value.dim():
-            gate = gate.unsqueeze(-1)
-        gate = gate.clamp_min(self.config.parallel_scan_epsilon)
-        gate_prod = torch.cumprod(gate, dim=2)
-        return gate_prod * (initial.unsqueeze(2) + torch.cumsum(value / gate_prod, dim=2))
+    def _build_chunk_operators(
+        self,
+        theta: torch.Tensor,
+        eta: torch.Tensor,
+        alpha: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scalar coefficients for the chunk-start-gradient momentum/decay recurrence."""
+        size = theta.shape[-1]
+        positions = torch.arange(size, device=theta.device)
+        below_diagonal = positions[:, None] > positions[None, :]
+        dtype = torch.float64 if theta.dtype == torch.float64 else torch.float32
+        # Accumulate controls outside autocast. Interval products handle exact
+        # zeros and underflow without logarithms or division by prefix products.
+        with torch.autocast(device_type=theta.device.type, enabled=False):
+            eta = eta.to(dtype)
+            gamma = 1.0 - alpha.to(dtype)
+            eta_prod = eta.cumprod(dim=-1)
+            gamma_prod = gamma.cumprod(dim=-1)
+            eta_intervals = torch.where(below_diagonal, eta.unsqueeze(-1), 1.0).cumprod(dim=-2).tril()
+            gamma_intervals = torch.where(below_diagonal, gamma.unsqueeze(-1), 1.0).cumprod(dim=-2).tril()
+            sigma = (gamma_intervals @ eta_prod.unsqueeze(-1)).squeeze(-1)
+            surprise_coeff = eta_intervals * theta.to(dtype).unsqueeze(-2)
+            weight_coeff = gamma_intervals @ surprise_coeff
+        return tuple(
+            coefficient.to(theta.dtype)
+            for coefficient in (eta_prod, gamma_prod, sigma, surprise_coeff, weight_coeff)
+        )
 
     def _parallel_chunk(
         self,
@@ -514,40 +593,55 @@ class TitansNeuralMemory(nn.Module):
             output = self._mlp_forward(queries, state["weights"], state["biases"])[0]
             return output, state
 
-        grad_weights, grad_biases = self._gradients(keys, values, state["weights"], state["biases"])
-        next_weights = []
-        next_biases = []
-        next_surprise_weights = []
-        next_surprise_biases = []
-        weight_sequences = []
-        bias_sequences = []
-        delta_gate = 1.0 - alpha
+        acts, deltas = self._gradient_factors(keys, values, state["weights"], state["biases"])
+        eta_prod, gamma_prod, sigma, surprise_coeff, weight_coeff = self._build_chunk_operators(theta, eta, alpha)
+        surprise_last = surprise_coeff[:, :, -1, :, None]
+        weight_last = weight_coeff[:, :, -1, :, None]
+        eta_last = eta_prod[:, :, -1, None, None]
+        gamma_last = gamma_prod[:, :, -1, None, None]
+        sigma_last = sigma[:, :, -1, None, None]
+        next_weights, next_biases = [], []
+        next_surprise_weights, next_surprise_biases = [], []
 
-        for weight, surprise, grad in zip(state["weights"], state["surprise_weights"], grad_weights):
-            surprise_seq = self._scan_affine(eta, -theta.unsqueeze(-1).unsqueeze(-1) * grad, surprise)
-            weight_seq = self._scan_affine(delta_gate, surprise_seq, weight)
-            next_weights.append(weight_seq[:, :, -1])
-            next_surprise_weights.append(surprise_seq[:, :, -1])
-            weight_sequences.append(weight_seq)
+        for idx, delta in enumerate(deltas):
+            # Each per-token gradient is acts[idx][t] outer delta[t].
+            # Contract tokens before creating a weight-sized tensor.
+            surprise_delta = surprise_last * delta
+            weight_delta = weight_last * delta
+            next_surprise_weights.append(
+                eta_last * state["surprise_weights"][idx]
+                - torch.einsum("bhki,bhko->bhio", acts[idx], surprise_delta)
+            )
+            next_weights.append(
+                gamma_last * state["weights"][idx] + sigma_last * state["surprise_weights"][idx]
+                - torch.einsum("bhki,bhko->bhio", acts[idx], weight_delta)
+            )
+            next_surprise_biases.append(
+                eta_last * state["surprise_biases"][idx] - surprise_delta.sum(dim=2, keepdim=True)
+            )
+            next_biases.append(
+                gamma_last * state["biases"][idx] + sigma_last * state["surprise_biases"][idx]
+                - weight_delta.sum(dim=2, keepdim=True)
+            )
 
-        dynamic_weights = weight_sequences if output_after_update else [
-            weight.unsqueeze(2).expand(sample.shape[0], sample.shape[1], sample.shape[2], *weight.shape[-2:])
-            for weight, sample in zip(state["weights"], grad_weights)
-        ]
-
-        for bias, surprise, grad in zip(state["biases"], state["surprise_biases"], grad_biases):
-            surprise_seq = self._scan_affine(eta, -theta.unsqueeze(-1).unsqueeze(-1) * grad, surprise)
-            bias_seq = self._scan_affine(delta_gate, surprise_seq, bias)
-            next_biases.append(bias_seq[:, :, -1])
-            next_surprise_biases.append(surprise_seq[:, :, -1])
-            bias_sequences.append(bias_seq)
-
-        dynamic_biases = bias_sequences if output_after_update else [
-            bias.unsqueeze(2).expand(sample.shape[0], sample.shape[1], sample.shape[2], *bias.shape[-2:])
-            for bias, sample in zip(state["biases"], grad_biases)
-        ]
-
-        output = self._mlp_forward_dynamic(queries, dynamic_weights, dynamic_biases)
+        if output_after_update:
+            hidden = queries
+            gamma_col = gamma_prod.unsqueeze(-1)
+            sigma_col = sigma.unsqueeze(-1)
+            for idx, delta in enumerate(deltas):
+                base = torch.einsum("bhki,bhio->bhko", hidden, state["weights"][idx]) + state["biases"][idx]
+                momentum = (
+                    torch.einsum("bhki,bhio->bhko", hidden, state["surprise_weights"][idx])
+                    + state["surprise_biases"][idx]
+                )
+                # The +1 folds the bias gradient into the same dual contraction.
+                similarities = torch.einsum("bhki,bhji->bhkj", hidden, acts[idx]) + 1.0
+                hidden = gamma_col * base + sigma_col * momentum - (weight_coeff * similarities) @ delta
+                if idx != len(deltas) - 1:
+                    hidden = self.act_fn(hidden)
+            output = queries + hidden if self.config.memory_residual else hidden
+        else:
+            output = self._mlp_forward(queries, state["weights"], state["biases"])[0]
         next_state = {
             "weights": next_weights,
             "biases": next_biases,
@@ -573,7 +667,7 @@ class TitansNeuralMemory(nn.Module):
         for token_idx in range(queries.shape[2]):
             q = queries[:, :, token_idx : token_idx + 1]
             if update:
-                grad_w, grad_b = self._gradients(
+                acts, deltas = self._gradient_factors(
                     keys[:, :, token_idx : token_idx + 1],
                     values[:, :, token_idx : token_idx + 1],
                     cur_state["weights"],
@@ -582,10 +676,11 @@ class TitansNeuralMemory(nn.Module):
                 next_state = {"weights": [], "biases": [], "surprise_weights": [], "surprise_biases": []}
                 for idx in range(len(cur_state["weights"])):
                     s_w = eta[:, :, token_idx].view(*eta.shape[:2], 1, 1) * cur_state["surprise_weights"][idx]
-                    s_w = s_w - theta[:, :, token_idx].view(*theta.shape[:2], 1, 1) * grad_w[idx].squeeze(2)
+                    grad_w = torch.einsum("bhki,bhko->bhio", acts[idx], deltas[idx])
+                    s_w = s_w - theta[:, :, token_idx].view(*theta.shape[:2], 1, 1) * grad_w
                     w = (1.0 - alpha[:, :, token_idx]).view(*alpha.shape[:2], 1, 1) * cur_state["weights"][idx] + s_w
                     s_b = eta[:, :, token_idx].view(*eta.shape[:2], 1, 1) * cur_state["surprise_biases"][idx]
-                    s_b = s_b - theta[:, :, token_idx].view(*theta.shape[:2], 1, 1) * grad_b[idx].squeeze(2)
+                    s_b = s_b - theta[:, :, token_idx].view(*theta.shape[:2], 1, 1) * deltas[idx]
                     b = (1.0 - alpha[:, :, token_idx]).view(*alpha.shape[:2], 1, 1) * cur_state["biases"][idx] + s_b
                     next_state["weights"].append(w)
                     next_state["biases"].append(b)
@@ -626,12 +721,26 @@ class TitansNeuralMemory(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
         state = self._state_from_cache_or_init(hidden_states, past_key_values) if state is None else state
         queries, keys, values, theta, eta, alpha = self._project(hidden_states, past_key_values, use_cache)
+        cache_chunk = (
+            past_key_values is not None and use_cache and update_cache and update
+            and self.config.use_parallel_memory_training
+        )
+        projected = (queries, keys, values, theta, eta, alpha)
+        pending_length = 0
+        if cache_chunk:
+            pending = past_key_values.memory_chunk_inputs[self.layer_idx]
+            if pending is not None:
+                pending_length = pending[0].shape[2]
+                projected = tuple(torch.cat([old, new], dim=2) for old, new in zip(pending, projected))
+                state = past_key_values.memory_chunk_states[self.layer_idx]
+        queries, keys, values, theta, eta, alpha = projected
 
         outputs = []
         cur_state = state
         scan_fn = self._parallel_chunk if self.config.use_parallel_memory_training else self._sequential_chunk
-        for start in range(0, hidden_states.shape[1], self.chunk_size):
-            end = min(start + self.chunk_size, hidden_states.shape[1])
+        for start in range(0, queries.shape[2], self.chunk_size):
+            end = min(start + self.chunk_size, queries.shape[2])
+            chunk_start_state = cur_state
             chunk_output, cur_state = scan_fn(
                 queries[:, :, start:end],
                 keys[:, :, start:end],
@@ -645,7 +754,17 @@ class TitansNeuralMemory(nn.Module):
             )
             outputs.append(chunk_output)
 
-        memory_output = torch.cat(outputs, dim=2).transpose(1, 2).reshape(
+        if cache_chunk:
+            remainder = queries.shape[2] % self.chunk_size
+            past_key_values.memory_chunk_inputs[self.layer_idx] = (
+                tuple(value[:, :, -remainder:].detach().clone() for value in projected) if remainder else None
+            )
+            past_key_values.memory_chunk_states[self.layer_idx] = (
+                {key: [value.detach() for value in values] for key, values in chunk_start_state.items()}
+                if remainder else None
+            )
+
+        memory_output = torch.cat(outputs, dim=2)[:, :, pending_length:].transpose(1, 2).reshape(
             hidden_states.shape[0], hidden_states.shape[1], self.memory_width
         )
         memory_output = self.out_norm(memory_output)
@@ -655,7 +774,6 @@ class TitansNeuralMemory(nn.Module):
         if past_key_values is not None and use_cache and update_cache:
             past_key_values.set_memory_state(self.layer_idx, cur_state, detach=True)
         return memory_output, cur_state
-
 
 class TitansAttention(nn.Module):
     def __init__(self, config: TitansConfig, layer_idx: int):
@@ -669,16 +787,13 @@ class TitansAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        self.is_causal = True
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.rotary_emb = TitansRotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        self.rotary_emb = TitansRotaryEmbedding(config)
 
         if config.use_attention_convolution:
             self.q_conv = TitansDepthwiseConv1d(self.num_heads * self.head_dim, config.attention_qkv_conv_kernel)
@@ -730,6 +845,7 @@ class TitansAttention(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         sliding_window: Optional[int],
+        prefix_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         query_positions = torch.arange(past_token_length, past_token_length + query_length, device=device)
         key_prefix = torch.full((prefix_length,), -1, device=device, dtype=torch.long)
@@ -769,6 +885,9 @@ class TitansAttention(nn.Module):
                 prefix_mask = torch.ones(batch_size, prefix_length, device=device, dtype=attention_mask.dtype)
                 key_mask = torch.cat([prefix_mask, token_mask], dim=-1)
             mask = mask.masked_fill(key_mask[:, None, None, :].to(torch.bool).logical_not(), torch.finfo(torch.float32).min)
+        if prefix_attention_mask is not None:
+            blocked = F.pad(~prefix_attention_mask.to(torch.bool), (0, key_length - prefix_length), value=False)
+            mask = mask.masked_fill(blocked[:, None], torch.finfo(torch.float32).min)
         return mask.to(dtype)
 
     def forward(
@@ -782,6 +901,8 @@ class TitansAttention(nn.Module):
         prefix_states: Optional[torch.Tensor] = None,
         sliding_window: Optional[int] = None,
         cache_attention: bool = True,
+        prefix_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, query_length, _ = hidden_states.shape
         if position_ids is None:
@@ -793,51 +914,77 @@ class TitansAttention(nn.Module):
         key = self._shape_kv(key)
         value = self._shape_kv(value)
 
-        cos, sin = self.rotary_emb(value, position_ids)
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
         query = l2norm(query, dim=-1, eps=self.config.l2_norm_eps)
         key = l2norm(key, dim=-1, eps=self.config.l2_norm_eps)
-
         prefix_key, prefix_value = self._project_prefix(prefix_states)
         prefix_length = 0 if prefix_key is None else prefix_key.shape[2]
-        if prefix_key is not None:
-            prefix_position_ids = torch.arange(prefix_length, device=hidden_states.device).unsqueeze(0)
-            prefix_cos, prefix_sin = self.rotary_emb(prefix_value, prefix_position_ids)
-            empty_query = prefix_key.new_empty(prefix_key.shape[0], self.num_key_value_heads, prefix_length, self.head_dim)
-            _, prefix_key = apply_rotary_pos_emb(empty_query, prefix_key, prefix_cos, prefix_sin)
+        if prefix_length:
+            # MAG's stream is P || x, so real token positions follow P.
+            if self.config.variant == "mag":
+                position_ids = position_ids + prefix_length
+            prefix_positions = torch.arange(prefix_length, device=hidden_states.device)[None].expand(batch_size, -1)
+            rope_positions = torch.cat([prefix_positions, position_ids.expand(batch_size, -1)], dim=1)
+        else:
+            rope_positions = position_ids
+        # One call keeps dynamic RoPE's frequency basis consistent for prefix and tokens.
+        cos, sin = self.rotary_emb(value, rope_positions)
+        query, key = apply_rotary_pos_emb(query, key, cos[:, prefix_length:], sin[:, prefix_length:])
+        if prefix_length:
             prefix_key = l2norm(prefix_key, dim=-1, eps=self.config.l2_norm_eps)
+            prefix_cos, prefix_sin = cos[:, None, :prefix_length], sin[:, None, :prefix_length]
+            rotary_dim = prefix_cos.shape[-1]
+            prefix_rot = prefix_key[..., :rotary_dim]
+            rotated = prefix_rot * prefix_cos + rotate_half(prefix_rot) * prefix_sin
+            prefix_key = torch.cat([rotated, prefix_key[..., rotary_dim:]], dim=-1) if rotary_dim != self.head_dim else rotated
 
         past_token_length = 0
         if past_key_values is not None and use_cache and cache_attention:
-            past_token_length = past_key_values.get_seq_length(self.layer_idx)
+            cached_key = past_key_values.key_cache[self.layer_idx]
+            past_token_length = 0 if cached_key is None else cached_key.shape[2]
             key, value = past_key_values.update_attention(key, value, self.layer_idx, sliding_window)
-            if sliding_window is not None:
-                past_token_length = max(0, key.shape[2] - query_length)
 
         if prefix_key is not None:
             key = torch.cat([prefix_key, key], dim=2)
             value = torch.cat([prefix_value, value], dim=2)
 
-        key = repeat_kv(key, self.num_key_value_groups)
-        value = repeat_kv(value, self.num_key_value_groups)
+        implementation = self.config._attn_implementation or "eager"
+        uses_flash = is_flash_attention_requested(requested_attention_implementation=implementation)
+        if output_attentions and implementation != "eager":
+            logger.warning_once("Titans uses eager attention when output_attentions=True.")
+            implementation = "eager"
+            uses_flash = False
+        elif uses_flash and (prefix_attention_mask is not None or (prefix_length and sliding_window is not None)):
+            logger.warning_once(
+                "Titans prefix attention cannot be represented by a FlashAttention sliding window. "
+                "Using SDPA for this attention call to preserve the persistent/retrieved prefix mask."
+            )
+            implementation = "sdpa"
+            uses_flash = False
 
-        attn_weights = torch.matmul(query.to(torch.float32), key.transpose(-1, -2).to(torch.float32)) * self.scaling
-        mask = self._attention_mask(
-            batch_size,
-            query_length,
-            key.shape[2],
-            prefix_length,
-            past_token_length,
-            attention_mask,
-            hidden_states.device,
-            attn_weights.dtype,
-            sliding_window,
+        if uses_flash:
+            if prefix_length and attention_mask is not None:
+                attention_mask = F.pad(attention_mask, (prefix_length, 0), value=1)
+            mask = flash_attention_mask(
+                batch_size=batch_size,
+                q_length=query_length,
+                kv_length=key.shape[2],
+                attention_mask=attention_mask,
+            )
+        else:
+            mask = self._attention_mask(
+                batch_size, query_length, key.shape[2], prefix_length, past_token_length,
+                attention_mask, hidden_states.device, query.dtype, sliding_window, prefix_attention_mask,
+            )
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(implementation, eager_attention_forward)
+        attn_output, attn_weights = attention_interface(
+            self, query, key, value, mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=self.scaling,
+            sliding_window=sliding_window,
+            is_causal=True,
+            **kwargs,
         )
-        attn_weights = attn_weights + mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, query_length, self.hidden_size)
+        attn_output = attn_output.reshape(batch_size, query_length, self.hidden_size)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights if output_attentions else None
 
@@ -858,7 +1005,7 @@ class TitansFusionGate(nn.Module):
         return self.out_proj(gate * core_n + (1.0 - gate) * memory_n)
 
 
-class TitansDecoderLayer(nn.Module):
+class TitansDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: TitansConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -882,7 +1029,14 @@ class TitansDecoderLayer(nn.Module):
             return None
         return self.persistent_memory.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _with_persistent(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, int]:
+    def _with_persistent(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+    ) -> tuple[torch.Tensor, int]:
+        if use_cache and past_key_values is not None and past_key_values.seqlen_offset > 0:
+            return hidden_states, 0
         persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
         if persistent is None:
             return hidden_states, 0
@@ -896,7 +1050,7 @@ class TitansDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         memory_input = self.memory_norm(hidden_states)
-        memory_input, prefix_len = self._with_persistent(memory_input)
+        memory_input, prefix_len = self._with_persistent(memory_input, past_key_values, use_cache)
         memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
         memory_output = memory_output[:, prefix_len:]
         hidden_states = residual + self.resid_dropout(memory_output)
@@ -910,26 +1064,38 @@ class TitansDecoderLayer(nn.Module):
         past_key_values: Optional[TitansCache],
         use_cache: bool,
         output_attentions: bool,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         memory_input = self.memory_norm(hidden_states)
-        memory_input, prefix_len = self._with_persistent(memory_input)
+        memory_input, prefix_len = self._with_persistent(memory_input, past_key_values, use_cache)
         memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
-        memory_output = memory_output[:, prefix_len:]
+        if prefix_len:
+            residual = torch.cat([memory_input[:, :prefix_len], residual], dim=1)
+        if attention_mask is not None:
+            attention_mask = F.pad(attention_mask, (self.config.persistent_memory_tokens, 0), value=1)
         hidden_states = residual + self.resid_dropout(memory_output)
 
+        # MAL attends over M(P || x), including the transformed persistent tokens.
+        if position_ids is not None:
+            position_ids = position_ids + self.config.persistent_memory_tokens
+            if prefix_len:
+                prefix_positions = torch.arange(prefix_len, device=hidden_states.device)
+                position_ids = torch.cat([prefix_positions[None].expand(hidden_states.shape[0], -1), position_ids], dim=1)
         residual = hidden_states
-        attn_input = self.attn_norm(hidden_states)
         attn_output, attn_weights = self.self_attn(
-            attn_input,
+            self.attn_norm(hidden_states),
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             sliding_window=self.config.sliding_window,
+            **kwargs,
         )
-        hidden_states = residual + self.resid_dropout(attn_output)
+        hidden_states = (residual + self.resid_dropout(attn_output))[:, prefix_len:]
+        if attn_weights is not None:
+            attn_weights = attn_weights[:, :, prefix_len:]
         return hidden_states, attn_weights
 
     def _forward_mag(
@@ -940,6 +1106,7 @@ class TitansDecoderLayer(nn.Module):
         past_key_values: Optional[TitansCache],
         use_cache: bool,
         output_attentions: bool,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         branch_input = self.attn_norm(hidden_states)
@@ -953,8 +1120,9 @@ class TitansDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             prefix_states=persistent,
             sliding_window=self.config.sliding_window,
+            **kwargs,
         )
-        memory_input, prefix_len = self._with_persistent(branch_input)
+        memory_input, prefix_len = self._with_persistent(branch_input, past_key_values, use_cache)
         memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
         memory_output = memory_output[:, prefix_len:]
         hidden_states = residual + self.resid_dropout(self.fusion(attn_output, memory_output, branch_input))
@@ -968,40 +1136,60 @@ class TitansDecoderLayer(nn.Module):
         past_key_values: Optional[TitansCache],
         use_cache: bool,
         output_attentions: bool,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         memory_input = self.memory_norm(hidden_states)
         state = self.memory._state_from_cache_or_init(memory_input, past_key_values)
-        local_attention_mask = attention_mask
-        if local_attention_mask is not None and local_attention_mask.shape[-1] != hidden_states.shape[1]:
-            local_attention_mask = local_attention_mask[:, -hidden_states.shape[1] :]
+        local_mask = (
+            attention_mask[:, -hidden_states.shape[1]:]
+            if attention_mask is not None else torch.ones(memory_input.shape[:2], device=memory_input.device, dtype=torch.long)
+        )
+        if position_ids is None:
+            offset = past_key_values.seqlen_offset if past_key_values is not None else 0
+            position_ids = torch.arange(offset, offset + hidden_states.shape[1], device=memory_input.device)[None]
+            position_ids = position_ids.expand(hidden_states.shape[0], -1)
+        cached_segment = past_key_values is not None and use_cache
+        pending_length = 0
+        if cached_segment:
+            pending = past_key_values.mac_segment_inputs[self.layer_idx]
+            if pending is not None:
+                pending_length = pending[0].shape[1]
+                memory_input = torch.cat([pending[0], memory_input], dim=1)
+                local_mask = torch.cat([pending[1], local_mask], dim=1)
+                position_ids = torch.cat([pending[2], position_ids], dim=1)
+                state = past_key_values.mac_segment_states[self.layer_idx]
         outputs = []
         attn_collection = [] if output_attentions else None
         segment_size = self.config.mac_segment_size
         persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
 
-        for start in range(0, hidden_states.shape[1], segment_size):
-            end = min(start + segment_size, hidden_states.shape[1])
+        for start in range(0, memory_input.shape[1], segment_size):
+            end = min(start + segment_size, memory_input.shape[1])
             segment = memory_input[:, start:end]
-            segment_mask = local_attention_mask[:, start:end] if local_attention_mask is not None else None
-            segment_pos = position_ids[:, start:end] if position_ids is not None else None
-            historical = self.memory.retrieve(segment, state, past_key_values=past_key_values, use_cache=use_cache)
+            segment_mask = local_mask[:, start:end]
+            segment_start_state = state
+            # Retrieval and update convolutions each process their own segment.
+            # Replaying an incomplete segment preserves the same frozen base.
+            historical = self.memory.retrieve(segment, state)
             prefix = historical if persistent is None else torch.cat([persistent, historical], dim=1)
+            historical_mask = torch.ones(end - start, end - start, device=segment.device, dtype=torch.bool).tril()
+            historical_mask = historical_mask[None] & segment_mask[:, None].to(torch.bool)
+            persistent_len = 0 if persistent is None else persistent.shape[1]
+            prefix_mask = F.pad(historical_mask, (persistent_len, 0), value=True)
             attn_output, attn_weights = self.self_attn(
                 segment,
                 attention_mask=segment_mask,
-                position_ids=segment_pos,
-                past_key_values=past_key_values,
-                use_cache=False,
+                position_ids=position_ids[:, start:end],
                 output_attentions=output_attentions,
                 prefix_states=prefix,
+                prefix_attention_mask=prefix_mask,
                 sliding_window=None,
                 cache_attention=False,
+                **kwargs,
             )
             memory_output, state = self.memory(
                 attn_output,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
                 state=state,
                 update=True,
                 output_after_update=True,
@@ -1009,11 +1197,20 @@ class TitansDecoderLayer(nn.Module):
             )
             outputs.append(self.fusion(attn_output, memory_output, segment))
             if output_attentions:
-                attn_collection.append(attn_weights)
+                attn_collection.append(attn_weights[:, :, max(0, pending_length - start):])
 
-        if past_key_values is not None and use_cache:
+        if cached_segment:
             past_key_values.set_memory_state(self.layer_idx, state, detach=True)
-        hidden_states = residual + self.resid_dropout(torch.cat(outputs, dim=1))
+            remainder = memory_input.shape[1] % segment_size
+            past_key_values.mac_segment_inputs[self.layer_idx] = (
+                tuple(value[:, -remainder:].detach().clone() for value in (memory_input, local_mask, position_ids))
+                if remainder else None
+            )
+            past_key_values.mac_segment_states[self.layer_idx] = (
+                {key: [value.detach() for value in values] for key, values in segment_start_state.items()}
+                if remainder else None
+            )
+        hidden_states = residual + self.resid_dropout(torch.cat(outputs, dim=1)[:, pending_length:])
         if output_attentions:
             return hidden_states, tuple(attn_collection)
         return hidden_states, None
@@ -1026,20 +1223,21 @@ class TitansDecoderLayer(nn.Module):
         past_key_values: Optional[TitansCache] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.variant == "lmm":
             hidden_states, attn_weights = self._forward_lmm(hidden_states, past_key_values, use_cache)
         elif self.variant == "mal":
             hidden_states, attn_weights = self._forward_mal(
-                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions
+                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions, **kwargs
             )
         elif self.variant == "mag":
             hidden_states, attn_weights = self._forward_mag(
-                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions
+                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions, **kwargs
             )
         elif self.variant == "mac":
             hidden_states, attn_weights = self._forward_mac(
-                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions
+                hidden_states, attention_mask, position_ids, past_key_values, use_cache, output_attentions, **kwargs
             )
         else:  # pragma: no cover - config validation prevents this.
             raise ValueError(f"Unsupported Titans variant {self.variant!r}.")
@@ -1056,19 +1254,15 @@ class TitansPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["TitansDecoderLayer"]
-    _supports_cache_class = True
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_attention_backend = True
+    _supports_context_parallel = False
 
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
-                init.zeros_(module.weight[module.padding_idx])
-        elif isinstance(module, TitansNeuralMemory):
+        super()._init_weights(module)
+        if isinstance(module, TitansNeuralMemory):
             for weight in module.weights:
                 init.normal_(weight, mean=0.0, std=std)
             for bias in module.biases:
@@ -1101,7 +1295,6 @@ class TitansModel(TitansPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([TitansDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1109,6 +1302,75 @@ class TitansModel(TitansPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def _forward_padded(
+        self,
+        inputs_embeds: torch.Tensor,
+        valid: torch.Tensor,
+        position_ids: Optional[torch.LongTensor],
+        past_key_values: Optional[TitansCache],
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> TitansModelOutputWithPast:
+        """Run each unpadded stream so padding never advances memory or convolutions."""
+        batch_size, seq_len, _ = inputs_embeds.shape
+        if past_key_values is not None and past_key_values.batch_caches is not None:
+            cache = past_key_values
+            row_caches = cache.batch_caches
+        else:
+            row_caches = [
+                past_key_values._select_batch(torch.tensor([row], device=inputs_embeds.device))
+                if past_key_values is not None else None
+                for row in range(batch_size)
+            ]
+            cache = TitansCache(self.config, batch_size, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            cache.seqlen_offset = past_key_values.seqlen_offset if past_key_values is not None else 0
+        hidden_rows = []
+        hidden_collections = [[] for _ in range(len(self.layers) + 1)] if output_hidden_states else None
+        attention_collections = [[] for _ in self.layers] if output_attentions else None
+        if position_ids is not None:
+            position_ids = position_ids.expand(batch_size, -1)
+        for row in range(batch_size):
+            indices = valid[row].nonzero(as_tuple=True)[0]
+            empty = inputs_embeds[row] * 0.0
+            if indices.numel() == 0:
+                hidden_rows.append(empty)
+                if output_hidden_states:
+                    for collection in hidden_collections:
+                        collection.append(empty)
+                if output_attentions:
+                    for collection in attention_collections:
+                        collection.append(None)
+                continue
+            result = self(
+                inputs_embeds=inputs_embeds[row:row + 1].index_select(1, indices),
+                position_ids=position_ids[row:row + 1].index_select(1, indices) if position_ids is not None else None,
+                past_key_values=row_caches[row],
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                **kwargs,
+            )
+            hidden_rows.append(empty.index_copy(0, indices, result.last_hidden_state[0]))
+            row_caches[row] = result.past_key_values
+            if output_hidden_states:
+                for collection, value in zip(hidden_collections, result.hidden_states):
+                    collection.append(empty.index_copy(0, indices, value[0]))
+            if output_attentions:
+                for collection, value in zip(attention_collections, result.attentions):
+                    collection.append(value)
+        if use_cache:
+            cache.batch_caches = row_caches
+            cache.seqlen_offset += seq_len
+        return TitansModelOutputWithPast(
+            last_hidden_state=torch.stack(hidden_rows),
+            past_key_values=cache if use_cache else None,
+            hidden_states=tuple(torch.stack(rows) for rows in hidden_collections) if output_hidden_states else None,
+            attentions=tuple(tuple(rows) for rows in attention_collections) if output_attentions else None,
+        )
 
     def forward(
         self,
@@ -1122,6 +1384,7 @@ class TitansModel(TitansPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_params: Optional[TitansCache] = None,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, TitansModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1135,16 +1398,25 @@ class TitansModel(TitansPreTrainedModel):
 
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
+        if any(kwargs.get(name) is not None for name in ("cu_seq_lens_q", "cu_seq_lens_k")):
+            raise ValueError("Titans recurrent memory does not support packed attention metadata. Use separate batch streams.")
 
         if self.training and use_cache:
-            use_cache = False
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
             use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         batch_size, seq_len, _ = inputs_embeds.shape
+        valid = attention_mask[:, -seq_len:].to(torch.bool) if attention_mask is not None else None
+        if (valid is not None and not bool(valid.all())) or (
+            past_key_values is not None and past_key_values.batch_caches is not None
+        ):
+            if valid is None:
+                valid = torch.ones((batch_size, seq_len), dtype=torch.bool, device=inputs_embeds.device)
+            outputs = self._forward_padded(
+                inputs_embeds, valid, position_ids, past_key_values, use_cache, output_attentions, output_hidden_states, **kwargs
+            )
+            return outputs if return_dict else outputs.to_tuple()
 
         if use_cache and past_key_values is None:
             past_key_values = TitansCache(
@@ -1175,25 +1447,15 @@ class TitansModel(TitansPreTrainedModel):
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            if self.gradient_checkpointing and self.training:
-                hidden_states, attn_weights = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    None,
-                    False,
-                    output_attentions,
-                )
-            else:
-                hidden_states, attn_weights = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                )
+            hidden_states, attn_weights = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
             if output_attentions:
                 all_attentions += (attn_weights,)
 
@@ -1245,38 +1507,6 @@ class TitansForCausalLM(TitansPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values: Optional[TitansCache] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-        model_inputs.update(
-            {
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache", True),
-                "attention_mask": attention_mask,
-            }
-        )
-        return model_inputs
-
-    def _update_model_kwargs_for_generation(self, outputs: ModelOutput, model_kwargs: dict[str, Any], **kwargs):
-        model_kwargs["past_key_values"] = outputs.past_key_values
-        if "attention_mask" in model_kwargs and model_kwargs["attention_mask"] is not None:
-            attention_mask = model_kwargs["attention_mask"]
-            model_kwargs["attention_mask"] = torch.cat(
-                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
-            )
-        return model_kwargs
-
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1290,6 +1520,8 @@ class TitansForCausalLM(TitansPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_params: Optional[TitansCache] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.return_dict
         outputs = self.model(
@@ -1303,18 +1535,14 @@ class TitansForCausalLM(TitansPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_params=cache_params,
+            **kwargs,
         )
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states).float()
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1).to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

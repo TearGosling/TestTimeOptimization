@@ -20,7 +20,7 @@ tokenizer: "NousResearch/Llama-2-7b-hf"
 training_args:
   device: "cuda"
   gradient_accumulation_steps: 1
-  gradient_checkpointing: true
+  activation_checkpointing: true
   learning_rate: 0.0003
   logging_steps: 1
   lr_scheduler_type: "cosine"
