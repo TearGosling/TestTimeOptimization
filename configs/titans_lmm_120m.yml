@@ -17,6 +17,10 @@ model:
   memory_mlp_expansion: 4
   persistent_memory_tokens: 4
 tokenizer: "NousResearch/Llama-2-7b-hf"
+liger_kernel:
+  rms_norm: true
+  swiglu: true
+  fused_linear_cross_entropy: true
 training_args:
   device: "cuda"
   gradient_accumulation_steps: 1

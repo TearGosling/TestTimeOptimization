@@ -4,6 +4,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from .src.models.titans import TitansConfig, TitansForCausalLM
 from .src.models.ttt import TTTConfig, TTTForCausalLM
+from .src.utils import LigerKernelConfig, patch_model_with_liger
 
 ModelConfigPair = namedtuple("ModelConfigPair", ["config_class", "model_class"])
 
@@ -24,4 +25,6 @@ __all__ = [
     "TitansConfig",
     "TitansForCausalLM",
     "MODEL_CONFIG_MAPPING",
+    "LigerKernelConfig",
+    "patch_model_with_liger",
 ]

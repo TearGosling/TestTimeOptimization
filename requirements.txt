@@ -1,6 +1,6 @@
 accelerate
 datasets
-liger-kernel
+liger-kernel>=0.8.5
 pyyaml
 transformers[kernels]>=5.23.0
 torch>=2.6.0

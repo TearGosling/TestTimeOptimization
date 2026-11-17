@@ -70,6 +70,12 @@ and `AutoModelForCausalLM`. Model-specific options are documented in the
 configuration files linked above. The full research roadmap remains in the
 architecture checklist.
 
+TTT keeps its original model equations, parameter names, float32 logits, and
+legacy cache tuple ordering. Its `TTTCache` is available as both `cache_params`
+and the standard `past_key_values` input/output alias. The model also supports
+`logits_to_keep`, Trainer token-count loss normalization, and activation
+checkpointing with the current Transformers interface.
+
 ## Installation
 
 ### Requirements
@@ -121,9 +127,9 @@ python -m pip check
 ```
 
 The requirements include Accelerate, Datasets, and Weights & Biases for the
-training script. The `transformers[kernels]` extra provides the supported Hub
-kernel loader. Installing Liger Kernel does not enable Liger integration in the
-models automatically.
+training script. `liger-kernel>=0.8.5` provides the optional training kernels.
+The `transformers[kernels]` extra also installs the separate Hugging Face Hub
+kernel loader. Liger components are selected explicitly in the training YAML.
 
 Check that the package imports and that PyTorch can see your GPU if needed:
 
@@ -208,6 +214,7 @@ accelerate launch train.py configs/titans_lmm_120m.yml
 | --- | --- |
 | `dataset` | Hugging Face dataset `name`, `max_seq_length`, and optional tokenization `num_proc` |
 | `model` | `type: "titans"` or `"ttt"`, followed by options accepted by that model's configuration class |
+| `liger_kernel` | Optional component switches for instance-local Liger patching |
 | `tokenizer` | A Hugging Face tokenizer ID or local tokenizer directory |
 | `training_args` | Hugging Face `TrainingArguments`, plus the script's `device` and `resume_from_checkpoint` options |
 
@@ -224,6 +231,57 @@ enable activation checkpointing. Supported hardware can use `bf16: true` or
 Larger memory chunks do not always reduce VRAM, and changing their size can
 change the learning behavior. Measure memory with your actual configuration
 before increasing batch size or context length.
+
+### Liger Kernel
+
+Select components in a top-level `liger_kernel` section, outside `model` and
+`training_args`. For example:
+
+```yaml
+liger_kernel:
+  rms_norm: true
+  swiglu: true
+  fused_linear_cross_entropy: true
+```
+
+Every omitted switch defaults to `false`. Omit the section to keep all native
+implementations. The example LMM configuration enables the three switches above.
+
+| Switch | Replaced operation |
+| --- | --- |
+| `rms_norm` | Titans or TTT RMSNorm, including their final normalization |
+| `layer_norm` | TTT's standard post-memory LayerNorm, not its analytic inner loss |
+| `swiglu` | Outer gated MLP with `hidden_act="silu"` or `"swish"` |
+| `geglu` | Outer gated MLP with `hidden_act="gelu_pytorch_tanh"` or `"gelu_new"` |
+| `rope` | Titans attention RoPE, including partial RoPE, or TTT's existing RoPE |
+| `cross_entropy` | Causal cross-entropy after materializing logits |
+| `fused_linear_cross_entropy` | Fused language-model projection and causal loss |
+
+Choose at most one MLP switch and one loss switch. Exact GELU cannot use the
+tanh-approximate GeGLU kernel. `layer_norm` is TTT-only, and Titans LMM rejects
+`rope` because it has no attention RoPE.
+
+`train.py` patches the constructed model before creating `Trainer`, including
+when loading a checkpoint to resume. These switches are separate from
+`training_args.use_liger_kernel`, which the script rejects to avoid applying a
+second, incompatible patching mechanism. Kernels require a supported accelerator.
+
+Fused loss skips the full vocabulary-logit tensor during training with targets,
+so `outputs.logits` is `None`. Pass `skip_logits=False` when you need logits from
+that patched model. Evaluation and generation retain normal logits by default.
+The adaptive memory update equations are not replaced by these switches.
+
+For an already constructed Python model:
+
+```python
+from tto import LigerKernelConfig, patch_model_with_liger
+
+patch_model_with_liger(model, LigerKernelConfig(rms_norm=True, swiglu=True))
+```
+
+Only the selected model instances are patched. Other models and PyTorch's global
+functions remain unchanged. Checkpoints retain ordinary model weights and can
+load without patching. Reapply the desired switches when resuming training.
 
 ### Checkpoints and resuming
 
@@ -293,14 +351,17 @@ Run the focused regression suite from the repository root:
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-  python -m unittest discover -s tests -p 'test_titans_*.py' -v
+  python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The current suite targets Titans. It checks the memory updates against explicit
-reference implementations, including outer gradients, and exercises causality,
-cached generation, checkpoint loading, and attention backends. The standard
-command runs on CPU without model downloads. The real FlashAttention GPU test
-is skipped unless explicitly enabled:
+The suite covers Titans memory updates and outer gradients, TTT's Transformers
+interfaces, serialization, cached generation, and Liger loss/gradient parity.
+Liger numerical tests use real CUDA kernels when CUDA and Liger are available.
+They are skipped on CPU, and the replication test requires two GPUs. Prefix the
+command with `CUDA_VISIBLE_DEVICES=""` to force CPU-only execution. No model
+downloads are needed.
+
+The separate FlashAttention GPU test remains opt-in:
 
 ```bash
 TITANS_TEST_FLASH_ATTENTION=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
@@ -325,8 +386,9 @@ tto/
   src/models/
     ttt/                      TTT configuration and implementation
     titans/                   Titans configuration and implementation
+  src/utils/                  Instance-local Liger configuration and adapters
 configs/                      Example training configurations
-tests/                        Titans regression tests
+tests/                        Model compatibility and kernel regression tests
 .github/workflows/tests.yml   CPU test workflow
 train.py                      YAML-driven training entry point
 infer.py                      Interactive generation entry point
@@ -359,7 +421,7 @@ Will add more papers as I find them.
 
 Various other things besides architectures themselves I have to implement, eventually (in no particular order):
 
-- [ ] [Liger Kernel](https://github.com/linkedin/Liger-Kernel) support.
+- [X] [Liger Kernel](https://github.com/linkedin/Liger-Kernel) support.
 - [ ] Add proper parallel associative scan implementation
 - [ ] Reduce redundancy by creating a common utils file
 - [ ] Add custom Triton kernels

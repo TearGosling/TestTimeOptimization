@@ -14,7 +14,7 @@ from transformers import (
 )
 from yaml import safe_load
 
-from tto import * # Necessary to register AutoConfig/AutoModel mappings
+from tto import LigerKernelConfig, MODEL_CONFIG_MAPPING, patch_model_with_liger
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = logging.getLogger(__name__)
@@ -48,13 +48,13 @@ def tokenize_function(examples, tokenizer, max_length=2048):
     return out
 
 def main():
-
     parser = argparse.ArgumentParser(description="Train a TTO model given a config.")
     parser.add_argument("config_file", type=str, help="Path to the YAML configuration file.")
     args = parser.parse_args()
 
     with open(args.config_file, "r") as f:
         config = safe_load(f)
+    liger_config = LigerKernelConfig(**config.get("liger_kernel", {}))
 
     model_args = config["model"]
     model_type = model_args.pop("type", "titans")
@@ -63,6 +63,8 @@ def main():
     device = training_args.pop("device", "cuda")
     # resume_from_checkpoint is fed into Trainer separately
     resume_checkpoint = training_args.pop("resume_from_checkpoint", None)
+    if training_args.get("use_liger_kernel"):
+        raise ValueError("Configure Liger components in the top-level 'liger_kernel' section instead of use_liger_kernel.")
     training_args = TrainingArguments(**training_args)
     # Backup W&B project naming since HF Trainer likes putting everything under the 'huggingface' project
     os.environ["WANDB_PROJECT"] = training_args.project
@@ -81,6 +83,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(resume_checkpoint)
 
     model = model.to(device=device)
+    model = patch_model_with_liger(model, liger_config)
     num_params = sum(p.numel() for p in model.parameters())
     LOG.info(f"Model initialized with {num_params:,} parameters.")
 

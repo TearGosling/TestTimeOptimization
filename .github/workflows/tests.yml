@@ -42,5 +42,5 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip check
 
-      - name: Run Titans regression tests
-        run: python -m unittest discover -s tests -p 'test_titans_*.py' -v
+      - name: Run model and Liger integration regression tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

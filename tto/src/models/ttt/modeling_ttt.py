@@ -2,23 +2,21 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
+
+from typing_extensions import Unpack
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
 from torch.utils._pytree import tree_map
 
 from transformers.activations import ACT2FN
+from transformers import initialization as init
 from transformers.generation import GenerationMixin
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, logging
+from transformers.utils import ModelOutput, TransformersKwargs, logging
 from transformers.utils.import_utils import is_causal_conv1d_available
 
 if is_causal_conv1d_available():
@@ -202,7 +200,7 @@ class TTTConv(nn.Module):
         # [B, C, L]
         hidden_states = hidden_states.transpose(1, 2)
 
-        if causal_conv1d_fn is None:
+        if causal_conv1d_fn is None or not hidden_states.is_cuda:
             if cache_params is not None:
                 if cache_params.seqlen_offset > 0:
                     conv_state = cache_params.conv_states_dic["pre_conv"][self.layer_idx]
@@ -398,27 +396,44 @@ class TTTCache:
 
     def update(self, py_tree, layer_idx, seq_len):
         if seq_len % self.mini_batch_size == 0:
-            # copy last mini-batch states, clear gradients
-            for name in self.ttt_param_names:
-                self.ttt_params_dict[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
-                self.ttt_params_dict[f"{name}_grad"][layer_idx].zero_()
+            update_states = True
         elif seq_len < self.mini_batch_size:
             if seq_len != 1 and self.seqlen_offset > 0 and self.seqlen_offset % self.mini_batch_size != 0:
                 raise ValueError("fractional update not supported yet.")
-            if (seq_len + self.seqlen_offset) % self.mini_batch_size == 0:
-                # copy last mini-batch states, clear gradients
-                for name in self.ttt_param_names:
-                    self.ttt_params_dict[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
-                    self.ttt_params_dict[f"{name}_grad"][layer_idx].zero_()
-            else:
-                # copy gradients for the next update
-                for name in self.ttt_param_names:
-                    self.ttt_params_dict[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
+            update_states = (seq_len + self.seqlen_offset) % self.mini_batch_size == 0
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
 
+        for name in self.ttt_param_names:
+            states = self.ttt_params_dict[f"{name}_states"]
+            gradients = self.ttt_params_dict[f"{name}_grad"]
+            if update_states:
+                if torch.is_grad_enabled():
+                    # Current outputs may have saved the previous cache tensors
+                    # for backward. Replace storage without breaking their graph.
+                    states[layer_idx] = py_tree[f"{name}_states"].to(states[layer_idx])
+                    gradients[layer_idx] = torch.zeros_like(gradients[layer_idx])
+                else:
+                    states[layer_idx].copy_(py_tree[f"{name}_states"])
+                    gradients[layer_idx].zero_()
+            elif torch.is_grad_enabled():
+                gradients[layer_idx] = py_tree[f"{name}_grad"].to(gradients[layer_idx])
+            else:
+                gradients[layer_idx].copy_(py_tree[f"{name}_grad"])
+
     def ttt_params_to_dict(self, layer_idx):
         return {name: self.ttt_params_dict[name][layer_idx] for name in self.ttt_params_dict}
+
+    is_compileable = False
+
+    def get_seq_length(self, layer_idx=0):
+        return self.seqlen_offset
+
+    def reorder_cache(self, beam_idx):
+        for states in (self.ttt_params_dict, self.conv_states_dic):
+            for layers in states.values():
+                for layer_idx, tensor in layers.items():
+                    layers[layer_idx] = tensor.index_select(0, beam_idx.to(tensor.device))
 
 
 class TTTBaseMemory(nn.Module):
@@ -426,6 +441,7 @@ class TTTBaseMemory(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.apply_rotary_pos_emb = apply_rotary_pos_emb
         if layer_idx is None:
             logger.warning_once(
                 f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
@@ -527,7 +543,7 @@ class TTTBaseMemory(nn.Module):
             xq, XV = self.q_proj(hidden_states), self.v_proj(hidden_states)
             seq_len = xq.shape[1]
             xq = xq.transpose(1, 2)
-            if causal_conv1d_fn is None:
+            if causal_conv1d_fn is None or not xq.is_cuda:
                 if cache_params is not None:
                     if cache_params.seqlen_offset > 0:
                         conv_q_state = cache_params.conv_states_dic["ttt_conv_q"][self.layer_idx]
@@ -694,7 +710,7 @@ class TTTBaseMemory(nn.Module):
 
         # permute_qk and undo_permute_qk is just for aligning pytorch with jax pre-training
         XQ, XK = permute_qk(XQ, XK)
-        XQ, XK = apply_rotary_pos_emb(XQ, XK, cos, sin)
+        XQ, XK = self.apply_rotary_pos_emb(XQ, XK, cos, sin)
         XQ, XK = undo_permute_qk(XQ, XK)
 
         output_hidden_states = []
@@ -1158,7 +1174,7 @@ class TTTPreTrainedModel(PreTrainedModel):
     config_class = TTTConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Block"]
+    _no_split_modules = ["TTTBlock"]
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -1170,10 +1186,42 @@ class TTTPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, TTTRotaryEmbedding):
+            inv_freq = 1.0 / (
+                module.base ** (
+                    torch.arange(0, module.dim, 2, dtype=torch.int64, device=module.inv_freq.device).float()
+                    / module.dim
+                )
+            )
+            init.copy_(module.inv_freq, inv_freq)
+        elif isinstance(module, TTTBaseMemory):
+            token_idx = 1.0 / torch.arange(
+                1, module.mini_batch_size + 1, device=module.token_idx.device
+            )
+            init.copy_(module.token_idx, token_idx)
+
+
+class _TTTCacheOutput:
+    """Expose the standard cache name without adding a second legacy tuple entry."""
+
+    @property
+    def past_key_values(self):
+        return self.cache_params
+
+    def __contains__(self, key):
+        return super().__contains__("cache_params" if key == "past_key_values" else key)
+
+    def __getitem__(self, key):
+        if isinstance(key, str) and key == "past_key_values":
+            key = "cache_params"
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
 
 
 @dataclass
-class TTTOutput(ModelOutput):
+class TTTOutput(_TTTCacheOutput, ModelOutput):
     """
     Class for the TTT model outputs.
 
@@ -1183,6 +1231,8 @@ class TTTOutput(ModelOutput):
         cache_params (`TTTCache`):
             The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
             avoid providing the old `input_ids`.
+            The same cache is also available as `past_key_values`, including mapping lookup,
+            without adding an extra element to the legacy output tuple.
     """
 
     last_hidden_state: Optional[torch.FloatTensor] = None
@@ -1191,7 +1241,7 @@ class TTTOutput(ModelOutput):
 
 
 @dataclass
-class TTTCausalLMOutput(ModelOutput):
+class TTTCausalLMOutput(_TTTCacheOutput, ModelOutput):
     """
     Base class for causal language model (or autoregressive) outputs.
 
@@ -1203,6 +1253,7 @@ class TTTCausalLMOutput(ModelOutput):
         cache_params (`TTTCache`):
             The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
             avoid providing the old `input_ids`.
+            Also exposed as the standard `past_key_values` alias.
     """
 
     loss: Optional[torch.FloatTensor] = None
@@ -1248,12 +1299,19 @@ class TTTModel(TTTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        *,
+        past_key_values: Optional[TTTCache] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Union[Tuple, TTTOutput]:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        if past_key_values is not None:
+            if cache_params is not None and cache_params is not past_key_values:
+                raise ValueError("cache_params and past_key_values must refer to the same cache")
+            cache_params = past_key_values
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -1285,7 +1343,9 @@ class TTTModel(TTTPreTrainedModel):
         hidden_states = inputs_embeds
 
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
+            attention_mask = torch.ones(
+                inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device
+            )
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1330,7 +1390,7 @@ class TTTModel(TTTPreTrainedModel):
 
 
 class TTTForCausalLM(TTTPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
         super().__init__(config)
@@ -1359,18 +1419,10 @@ class TTTForCausalLM(TTTPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    def _update_model_kwargs_for_generation(
-        self, outputs: ModelOutput, model_kwargs: Dict[str, Any], **kwargs
-    ) -> Dict[str, Any]:
-        model_kwargs["cache_params"] = outputs.get("cache_params", None)
-        # update attention mask
-        if "attention_mask" in model_kwargs:
-            attention_mask = model_kwargs["attention_mask"]
-            model_kwargs["attention_mask"] = torch.cat(
-                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
-                dim=-1,
-            )
-        return model_kwargs
+    @classmethod
+    def _supports_default_dynamic_cache(cls):
+        # TTT caches inner-model parameters and gradients rather than attention K/V.
+        return False
 
     def prepare_inputs_for_generation(
         self,
@@ -1378,17 +1430,23 @@ class TTTForCausalLM(TTTPreTrainedModel, GenerationMixin):
         attention_mask=None,
         cache_params: Optional[TTTCache] = None,
         inputs_embeds=None,
+        past_key_values: Optional[TTTCache] = None,
         **kwargs,
     ):
-        # only last token for inputs_ids if the state is passed along.
-        if cache_params is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-            attention_mask = attention_mask[:, -1].unsqueeze(-1) if attention_mask is not None else None
+        if past_key_values is not None:
+            if cache_params is not None and cache_params is not past_key_values:
+                raise ValueError("cache_params and past_key_values must refer to the same cache")
+            cache_params = past_key_values
+        # Only the last token is new after the initial prefill.
+        if cache_params is not None and cache_params.seqlen_offset > 0:
+            input_ids = input_ids[:, -1:]
+            attention_mask = attention_mask[:, -1:] if attention_mask is not None else None
 
-        if inputs_embeds is not None and cache_params is None:
+        if inputs_embeds is not None and (cache_params is None or cache_params.seqlen_offset == 0):
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
+        model_inputs.update(kwargs)
 
         model_inputs.update(
             {
@@ -1413,18 +1471,28 @@ class TTTForCausalLM(TTTPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         *,
         output_attentions: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        past_key_values: Optional[TTTCache] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Union[Tuple, TTTCausalLMOutput]:
         """
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+            past_key_values (`TTTCache`, *optional*):
+                Standard alias for `cache_params`. If both are supplied, they must be the same object.
+            logits_to_keep (`int` or `torch.Tensor`, *optional*, defaults to 0):
+                Compute logits for the last requested tokens, or the supplied sequence indices.
+                Zero preserves all legacy logits, which are always returned in float32.
+            num_items_in_batch (`torch.Tensor`, *optional*):
+                Normalize summed causal loss by this token count instead of the number of unmasked labels.
         """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         assert not output_attentions, "output_attentions is not available in TTTForCausalLM"
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
@@ -1433,13 +1501,17 @@ class TTTForCausalLM(TTTPreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             position_ids=position_ids,
             cache_params=cache_params,
+            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             use_cache=use_cache,
+            **kwargs,
         )
 
         hidden_states = outputs[0]
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        hidden_states = hidden_states[:, slice_indices, :]
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
@@ -1450,16 +1522,22 @@ class TTTForCausalLM(TTTPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss_kwargs = dict(kwargs)
+            shift_labels = loss_kwargs.pop("shift_labels", None)
+            if shift_labels is None:
+                # Preserve the legacy reduction shape and arithmetic for ordinary
+                # causal loss while using Transformers' token-count normalization.
+                loss_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+            else:
+                loss_logits = logits
+            loss = self.loss_function(
+                logits=loss_logits,
+                labels=labels,
+                shift_labels=shift_labels,
+                vocab_size=self.config.vocab_size,
+                **loss_kwargs,
+            )
 
         if not return_dict:
             output = (logits,) + outputs[1:]

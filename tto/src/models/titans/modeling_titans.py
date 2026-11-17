@@ -794,6 +794,7 @@ class TitansAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.rotary_emb = TitansRotaryEmbedding(config)
+        self.apply_rotary_pos_emb = apply_rotary_pos_emb
 
         if config.use_attention_convolution:
             self.q_conv = TitansDepthwiseConv1d(self.num_heads * self.head_dim, config.attention_qkv_conv_kernel)
@@ -928,7 +929,7 @@ class TitansAttention(nn.Module):
             rope_positions = position_ids
         # One call keeps dynamic RoPE's frequency basis consistent for prefix and tokens.
         cos, sin = self.rotary_emb(value, rope_positions)
-        query, key = apply_rotary_pos_emb(query, key, cos[:, prefix_length:], sin[:, prefix_length:])
+        query, key = self.apply_rotary_pos_emb(query, key, cos[:, prefix_length:], sin[:, prefix_length:])
         if prefix_length:
             prefix_key = l2norm(prefix_key, dim=-1, eps=self.config.l2_norm_eps)
             prefix_cos, prefix_sin = cos[:, None, :prefix_length], sin[:, None, :prefix_length]
