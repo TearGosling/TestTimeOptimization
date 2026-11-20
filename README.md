@@ -65,6 +65,18 @@ over multiple generated answers, are outside the current implementations.
 Titans variants are the memory-only Long-term Memory Module (LMM), Memory as a
 Context (MAC), Memory as a Gate (MAG), and Memory as a Layer (MAL).
 
+MAG and MAC combine normalized attention and memory outputs through a two-input
+gate, with the block residual added outside that gate. Separate pre-norms prepare
+memory inputs and the full attention context, including prefixes. MAC retrieves
+from its segment-start memory, attends to the context, then learns from attention's
+output and reads the causally updated memory.
+
+The [Titans paper](https://arxiv.org/abs/2501.00663v1) explicitly uses residuals
+but leaves exact pre-norm placement and nonlinear fusion underspecified. This
+implementation keeps query-dependent retrieval masks so future tokens cannot
+leak through the historical prefix. The normalization and retrieval corrections
+intentionally change MAG/MAC outputs from earlier implementations.
+
 Importing `tto` registers both model families with Hugging Face's `AutoConfig`
 and `AutoModelForCausalLM`. Model-specific options are documented in the
 configuration files linked above. The full research roadmap remains in the
@@ -356,6 +368,9 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 
 The suite covers Titans memory updates and outer gradients, TTT's Transformers
 interfaces, serialization, cached generation, and Liger loss/gradient parity.
+Two-rank CPU/Gloo regressions compare MAG/MAC gradients and optimizer updates
+against an equivalent global batch, with checkpointing on and off and
+`find_unused_parameters=False`. These distributed checks do not require GPUs.
 Liger numerical tests use real CUDA kernels when CUDA and Liger are available.
 They are skipped on CPU, and the replication test requires two GPUs. Prefix the
 command with `CUDA_VISIBLE_DEVICES=""` to force CPU-only execution. No model

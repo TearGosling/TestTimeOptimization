@@ -695,6 +695,10 @@ class TitansNeuralMemory(nn.Module):
             outputs.append(output)
         return torch.cat(outputs, dim=2), cur_state
 
+    def _output_projection(self, memory_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        memory_output = self.out_norm(memory_output) * F.silu(self.gate_proj(hidden_states))
+        return self.out_proj(memory_output)
+
     def retrieve(
         self,
         hidden_states: torch.Tensor,
@@ -707,7 +711,7 @@ class TitansNeuralMemory(nn.Module):
         )
         memory_output = self._mlp_forward(queries, state["weights"], state["biases"])[0]
         memory_output = memory_output.transpose(1, 2).reshape(hidden_states.shape[0], hidden_states.shape[1], self.memory_width)
-        return self.out_proj(self.out_norm(memory_output))
+        return self._output_projection(memory_output, hidden_states)
 
     def forward(
         self,
@@ -767,9 +771,7 @@ class TitansNeuralMemory(nn.Module):
         memory_output = torch.cat(outputs, dim=2)[:, :, pending_length:].transpose(1, 2).reshape(
             hidden_states.shape[0], hidden_states.shape[1], self.memory_width
         )
-        memory_output = self.out_norm(memory_output)
-        memory_output = memory_output * F.silu(self.gate_proj(hidden_states))
-        memory_output = self.out_proj(memory_output)
+        memory_output = self._output_projection(memory_output, hidden_states)
 
         if past_key_values is not None and use_cache and update_cache:
             past_key_values.set_memory_state(self.layer_idx, cur_state, detach=True)
@@ -991,18 +993,20 @@ class TitansAttention(nn.Module):
 
 
 class TitansFusionGate(nn.Module):
+    """Combine normalized attention and memory outputs, without the block residual."""
+
     def __init__(self, config: TitansConfig):
         super().__init__()
         self.memory_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.core_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.gate_proj = nn.Linear(config.hidden_size * 3, config.hidden_size, bias=True)
+        self.gate_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=True)
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.gate_bias = config.gate_bias
 
-    def forward(self, core: torch.Tensor, memory: torch.Tensor, residual_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, core: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
         core_n = self.core_norm(core)
         memory_n = self.memory_norm(memory)
-        gate = torch.sigmoid(self.gate_proj(torch.cat([core_n, memory_n, residual_input], dim=-1)) + self.gate_bias)
+        gate = torch.sigmoid(self.gate_proj(torch.cat([core_n, memory_n], dim=-1)) + self.gate_bias)
         return self.out_proj(gate * core_n + (1.0 - gate) * memory_n)
 
 
@@ -1110,10 +1114,12 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
-        branch_input = self.attn_norm(hidden_states)
+        attn_input = self.attn_norm(hidden_states)
         persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
+        if persistent is not None:
+            persistent = self.attn_norm(persistent)
         attn_output, attn_weights = self.self_attn(
-            branch_input,
+            attn_input,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1123,11 +1129,54 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
             sliding_window=self.config.sliding_window,
             **kwargs,
         )
-        memory_input, prefix_len = self._with_persistent(branch_input, past_key_values, use_cache)
+        memory_input, prefix_len = self._with_persistent(hidden_states, past_key_values, use_cache)
+        memory_input = self.memory_norm(memory_input)
         memory_output, _ = self.memory(memory_input, past_key_values=past_key_values, use_cache=use_cache)
         memory_output = memory_output[:, prefix_len:]
-        hidden_states = residual + self.resid_dropout(self.fusion(attn_output, memory_output, branch_input))
+        hidden_states = residual + self.resid_dropout(self.fusion(attn_output, memory_output))
         return hidden_states, attn_weights
+
+    def _forward_mac_segment(
+        self,
+        segment: torch.Tensor,
+        retrieval_input: torch.Tensor,
+        state: dict[str, list[torch.Tensor]],
+        persistent: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+        output_attentions: bool,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]], Optional[torch.Tensor]]:
+        # MAC: retrieve from the frozen past, attend to P || h || x, then
+        # learn from attention's output and read the causally updated memory.
+        historical = self.memory.retrieve(retrieval_input, state)
+        prefix = historical if persistent is None else torch.cat([persistent, historical], dim=1)
+        persistent_len = 0 if persistent is None else persistent.shape[1]
+        size = segment.shape[1]
+        historical_mask = torch.ones(size, size, device=segment.device, dtype=torch.bool).tril()
+        historical_mask = historical_mask[None] & attention_mask[:, None].to(torch.bool)
+        prefix_mask = F.pad(historical_mask, (persistent_len, 0), value=True)
+        # Retrievals depend on their corresponding input tokens. An earlier
+        # query must not see retrievals made from later tokens in this segment.
+        attn_output, attn_weights = self.self_attn(
+            self.attn_norm(segment),
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            prefix_states=self.attn_norm(prefix),
+            prefix_attention_mask=prefix_mask,
+            sliding_window=None,
+            cache_attention=False,
+            **kwargs,
+        )
+        memory_output, next_state = self.memory(
+            self.memory_norm(attn_output),
+            state=state,
+            update=True,
+            output_after_update=True,
+            update_cache=False,
+        )
+        return self.fusion(attn_output, memory_output), next_state, attn_weights
 
     def _forward_mac(
         self,
@@ -1140,71 +1189,59 @@ class TitansDecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
-        memory_input = self.memory_norm(hidden_states)
-        state = self.memory._state_from_cache_or_init(memory_input, past_key_values)
+        segments = hidden_states
         local_mask = (
             attention_mask[:, -hidden_states.shape[1]:]
-            if attention_mask is not None else torch.ones(memory_input.shape[:2], device=memory_input.device, dtype=torch.long)
+            if attention_mask is not None else torch.ones(hidden_states.shape[:2], device=hidden_states.device, dtype=torch.long)
         )
         if position_ids is None:
             offset = past_key_values.seqlen_offset if past_key_values is not None else 0
-            position_ids = torch.arange(offset, offset + hidden_states.shape[1], device=memory_input.device)[None]
+            position_ids = torch.arange(offset, offset + hidden_states.shape[1], device=hidden_states.device)[None]
             position_ids = position_ids.expand(hidden_states.shape[0], -1)
+
         cached_segment = past_key_values is not None and use_cache
         pending_length = 0
         if cached_segment:
             pending = past_key_values.mac_segment_inputs[self.layer_idx]
             if pending is not None:
                 pending_length = pending[0].shape[1]
-                memory_input = torch.cat([pending[0], memory_input], dim=1)
+                segments = torch.cat([pending[0], segments], dim=1)
                 local_mask = torch.cat([pending[1], local_mask], dim=1)
                 position_ids = torch.cat([pending[2], position_ids], dim=1)
-                state = past_key_values.mac_segment_states[self.layer_idx]
+
+        # Keep replay inputs raw. Retrieval and attention have separate
+        # pre-norms, and replay must not normalize an already-normalized token.
+        retrieval_inputs = self.memory_norm(segments)
+        state = (
+            past_key_values.mac_segment_states[self.layer_idx]
+            if pending_length else self.memory._state_from_cache_or_init(retrieval_inputs, past_key_values)
+        )
+        persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
         outputs = []
         attn_collection = [] if output_attentions else None
         segment_size = self.config.mac_segment_size
-        persistent = self._persistent(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
-
-        for start in range(0, memory_input.shape[1], segment_size):
-            end = min(start + segment_size, memory_input.shape[1])
-            segment = memory_input[:, start:end]
-            segment_mask = local_mask[:, start:end]
+        for start in range(0, segments.shape[1], segment_size):
+            end = min(start + segment_size, segments.shape[1])
             segment_start_state = state
-            # Retrieval and update convolutions each process their own segment.
-            # Replaying an incomplete segment preserves the same frozen base.
-            historical = self.memory.retrieve(segment, state)
-            prefix = historical if persistent is None else torch.cat([persistent, historical], dim=1)
-            historical_mask = torch.ones(end - start, end - start, device=segment.device, dtype=torch.bool).tril()
-            historical_mask = historical_mask[None] & segment_mask[:, None].to(torch.bool)
-            persistent_len = 0 if persistent is None else persistent.shape[1]
-            prefix_mask = F.pad(historical_mask, (persistent_len, 0), value=True)
-            attn_output, attn_weights = self.self_attn(
-                segment,
-                attention_mask=segment_mask,
+            output, state, attn_weights = self._forward_mac_segment(
+                segment=segments[:, start:end],
+                retrieval_input=retrieval_inputs[:, start:end],
+                state=state,
+                persistent=persistent,
+                attention_mask=local_mask[:, start:end],
                 position_ids=position_ids[:, start:end],
                 output_attentions=output_attentions,
-                prefix_states=prefix,
-                prefix_attention_mask=prefix_mask,
-                sliding_window=None,
-                cache_attention=False,
                 **kwargs,
             )
-            memory_output, state = self.memory(
-                attn_output,
-                state=state,
-                update=True,
-                output_after_update=True,
-                update_cache=False,
-            )
-            outputs.append(self.fusion(attn_output, memory_output, segment))
+            outputs.append(output)
             if output_attentions:
                 attn_collection.append(attn_weights[:, :, max(0, pending_length - start):])
 
         if cached_segment:
             past_key_values.set_memory_state(self.layer_idx, state, detach=True)
-            remainder = memory_input.shape[1] % segment_size
+            remainder = segments.shape[1] % segment_size
             past_key_values.mac_segment_inputs[self.layer_idx] = (
-                tuple(value[:, -remainder:].detach().clone() for value in (memory_input, local_mask, position_ids))
+                tuple(value[:, -remainder:].detach().clone() for value in (segments, local_mask, position_ids))
                 if remainder else None
             )
             past_key_values.mac_segment_states[self.layer_idx] = (
