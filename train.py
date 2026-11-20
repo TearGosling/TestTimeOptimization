@@ -11,10 +11,12 @@ from transformers import (
     default_data_collator,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 from yaml import safe_load
 
 from tto import LigerKernelConfig, MODEL_CONFIG_MAPPING, patch_model_with_liger
+from tto.src.utils import configure_distributed_environment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = logging.getLogger(__name__)
@@ -60,12 +62,24 @@ def main():
     model_type = model_args.pop("type", "titans")
 
     training_args = config["training_args"]
-    device = training_args.pop("device", "cuda")
+    if "device" in training_args:
+        raise ValueError(
+            "Remove training_args.device. Trainer selects each rank's device; "
+            "use CUDA_VISIBLE_DEVICES/the launcher for GPUs or use_cpu: true for CPU."
+        )
     # resume_from_checkpoint is fed into Trainer separately
     resume_checkpoint = training_args.pop("resume_from_checkpoint", None)
     if training_args.get("use_liger_kernel"):
         raise ValueError("Configure Liger components in the top-level 'liger_kernel' section instead of use_liger_kernel.")
+    configure_distributed_environment(use_cpu=training_args.get("use_cpu", False))
     training_args = TrainingArguments(**training_args)
+    LOG.setLevel(training_args.get_process_log_level())
+    LOG.info(
+        "Training rank %s/%s on %s (local rank %s).",
+        training_args.process_index, training_args.world_size,
+        training_args.device, training_args.local_process_index,
+    )
+    set_seed(training_args.seed)
     # Backup W&B project naming since HF Trainer likes putting everything under the 'huggingface' project
     os.environ["WANDB_PROJECT"] = training_args.project
 
@@ -76,26 +90,32 @@ def main():
     # If checkpoint has not been provided, initialize from config
     if resume_checkpoint is None:
         model_config_class = MODEL_CONFIG_MAPPING[model_type].config_class
-        model_class = MODEL_CONFIG_MAPPING[model_type].model_class
         model_config = model_config_class(**model_args)
-        model = model_class(model_config)
+        model = AutoModelForCausalLM.from_config(model_config)
     else:
-        model = AutoModelForCausalLM.from_pretrained(resume_checkpoint)
+        # Attention backends are runtime options, not serialized architecture.
+        model = AutoModelForCausalLM.from_pretrained(
+            resume_checkpoint, attn_implementation=model_args.get("attn_implementation")
+        )
 
-    model = model.to(device=device)
     model = patch_model_with_liger(model, liger_config)
     num_params = sum(p.numel() for p in model.parameters())
     LOG.info(f"Model initialized with {num_params:,} parameters.")
 
-    # Tokenize dataset.
-    dataset = load_dataset(config["dataset"]["name"], split="train")
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        fn_kwargs={"tokenizer": tokenizer, "max_length": config["dataset"]["max_seq_length"]},
-        remove_columns=dataset.column_names,
-        num_proc = config["dataset"].get("num_proc", os.cpu_count()),
-    )
+    # The leader populates the datasets cache before other ranks read it.
+    dataset_args = config["dataset"]
+    shared_cache = dataset_args.get("shared_cache", True)
+    if not isinstance(shared_cache, bool):
+        raise TypeError("dataset.shared_cache must be a boolean.")
+    with training_args.main_process_first(local=not shared_cache, desc="dataset preprocessing"):
+        dataset = load_dataset(dataset_args["name"], split="train")
+        tokenized_dataset = dataset.map(
+            tokenize_function,
+            batched=True,
+            fn_kwargs={"tokenizer": tokenizer, "max_length": dataset_args["max_seq_length"]},
+            remove_columns=dataset.column_names,
+            num_proc=dataset_args.get("num_proc"),
+        )
 
     collate_fn = default_data_collator
     LOG.info("Starting training...")
@@ -106,7 +126,10 @@ def main():
         data_collator=collate_fn,
         processing_class=tokenizer,
     )
-    trainer.train(resume_from_checkpoint=resume_checkpoint)
+    try:
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+    finally:
+        trainer.accelerator.end_training()
     LOG.info("Training complete. Check your output directory for checkpoints.")
 
 if __name__ == "__main__":

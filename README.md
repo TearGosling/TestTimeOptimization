@@ -138,8 +138,8 @@ python -m pip install -r requirements.txt
 python -m pip check
 ```
 
-The requirements include Accelerate, Datasets, and Weights & Biases for the
-training script. `liger-kernel>=0.8.5` provides the optional training kernels.
+The requirements include Accelerate 1.12 or newer, Datasets, and Weights & Biases
+for the training script. `liger-kernel>=0.8.5` provides the optional training kernels.
 The `transformers[kernels]` extra also installs the separate Hugging Face Hub
 kernel loader. Liger components are selected explicitly in the training YAML.
 
@@ -213,27 +213,85 @@ Titans LMM run with a 32K-token vocabulary.
 python train.py configs/titans_lmm_120m.yml
 ```
 
-For a distributed launch, configure Accelerate for your environment:
+### Distributed training
+
+Hugging Face `Trainer` already owns an Accelerate `Accelerator`. It handles
+distributed wrapping, data sharding, gradient synchronization, mixed precision,
+and checkpoint coordination. Do not create another `Accelerator` or manually
+wrap the model in DDP around this script.
+
+For two allocated, visible GPUs on one node, choose one launcher:
 
 ```bash
-accelerate config
-accelerate launch train.py configs/titans_lmm_120m.yml
+torchrun --standalone --nproc-per-node=2 train.py configs/titans_lmm_120m.yml
 ```
+
+Or use Accelerate:
+
+```bash
+accelerate launch --multi_gpu --num_processes 2 --num_machines 1 train.py configs/titans_lmm_120m.yml
+```
+
+Trainer chooses each worker's device. The old `training_args.device` field has
+been removed. Select GPUs through the launcher or `CUDA_VISIBLE_DEVICES`; CPU
+runs use `training_args.use_cpu: true` with Liger components disabled. Normally
+leave `ddp_backend` unset and let Accelerate select the appropriate backend.
+
+Data parallelism keeps a full model replica on each GPU. Adaptive memories stay
+local to each worker's sequences; only outer parameter gradients are synchronized.
+Effective batch size is `per_device_train_batch_size * world_size *
+gradient_accumulation_steps`. This does not pool GPU memory or add tensor,
+pipeline, or context parallelism.
+
+#### SLURM and multiple nodes
+
+Run one `torchrun` or Accelerate launcher per allocated node, not one multi-GPU
+launcher per GPU. Every node needs a unique node/machine rank, the same total
+node count, and a common rendezvous address and port. With `torchrun`, configure
+`--nnodes`, `--node-rank`, `--nproc-per-node`, `--master-addr`, and `--master-port`.
+With Accelerate, configure `--num_machines`, `--machine_rank`,
+`--main_process_ip`, and `--main_process_port`; its `--num_processes` is the
+total worker count across nodes. Inputs and checkpoint paths must be accessible
+on the participating nodes.
+
+Native launcher rank variables always take precedence over inherited SLURM
+allocation metadata. Direct `srun` Python workers are also supported when SLURM
+provides task ranks and per-node task counts. Multi-node direct workers must
+receive the same reachable, non-loopback `MASTER_ADDR` and `MASTER_PORT`.
+For a single-node direct launch, the defaults are loopback and port 29500.
+Choose a free port when sharing a node with other jobs.
+
+Direct GPU workers require a consistent view of the allocated node-local GPUs.
+The installed Accelerate integration uses the local rank as a DDP device
+ordinal, so a separate one-GPU visibility mask for each nonzero local rank is
+rejected. Use a per-node native launcher with the allocated GPUs visible instead.
+The script never changes scheduler GPU bindings or spawns additional workers.
+
+Scheduler allocation, network setup, and job submission remain external. The
+local regressions simulate SLURM worker environments; they do not submit jobs
+to a real SLURM cluster.
 
 ### Configuration
 
 | Section | Purpose |
 | --- | --- |
-| `dataset` | Hugging Face dataset `name`, `max_seq_length`, and optional tokenization `num_proc` |
+| `dataset` | Dataset `name`, `max_seq_length`, optional tokenization `num_proc`, and `shared_cache` |
 | `model` | `type: "titans"` or `"ttt"`, followed by options accepted by that model's configuration class |
 | `liger_kernel` | Optional component switches for instance-local Liger patching |
 | `tokenizer` | A Hugging Face tokenizer ID or local tokenizer directory |
-| `training_args` | Hugging Face `TrainingArguments`, plus the script's `device` and `resume_from_checkpoint` options |
+| `training_args` | Hugging Face `TrainingArguments`, plus the script's `resume_from_checkpoint` option |
 
 The script loads the dataset's `train` split and expects a `text` column. Each
 example is truncated or padded to `dataset.max_seq_length`, with padding ignored
 in the language-model loss. The script does not pack multiple examples together.
 Choose a tokenizer whose vocabulary matches the model's `vocab_size`.
+
+Preprocessing is rank-coordinated. `dataset.shared_cache: true` (the default)
+lets global rank zero populate a shared Hugging Face datasets cache before the
+other workers read it. Set it to `false` for node-local caches so each node's
+local leader prepares its own cache. Configure `HF_DATASETS_CACHE` consistently
+with that choice. Tokenization uses one process by default; set `dataset.num_proc`
+explicitly when additional allocated CPU workers are available.
 
 Before starting a run, check the model dimensions and `output_dir`. The example
 reports to Weights & Biases by default. Use `activation_checkpointing: true` to
@@ -308,6 +366,8 @@ training_args:
 Use a directory that exists from your run. The script loads the model from that
 checkpoint and asks `Trainer` to resume its saved training state. The checkpoint
 determines the model architecture when resuming.
+Runtime `model.attn_implementation` is reapplied from the YAML on resume because
+Transformers does not serialize that backend choice in the checkpoint config.
 
 ## Inference
 
@@ -371,6 +431,9 @@ interfaces, serialization, cached generation, and Liger loss/gradient parity.
 Two-rank CPU/Gloo regressions compare MAG/MAC gradients and optimizer updates
 against an equivalent global batch, with checkpointing on and off and
 `find_unused_parameters=False`. These distributed checks do not require GPUs.
+End-to-end training checks also exercise `torchrun`, the Accelerate CLI, simulated
+SLURM workers, equivalent-global-batch updates, preprocessing cache reuse, and
+checkpoint/optimizer resume using local CPU processes.
 Liger numerical tests use real CUDA kernels when CUDA and Liger are available.
 They are skipped on CPU, and the replication test requires two GPUs. Prefix the
 command with `CUDA_VISIBLE_DEVICES=""` to force CPU-only execution. No model

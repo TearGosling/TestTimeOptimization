@@ -1,6 +1,7 @@
 dataset:
   name: "codelion/fineweb-edu-1B"
   max_seq_length: 512
+  shared_cache: true
 model:
   type: "titans"
   vocab_size: 32000
@@ -22,7 +23,6 @@ liger_kernel:
   swiglu: true
   fused_linear_cross_entropy: true
 training_args:
-  device: "cuda"
   gradient_accumulation_steps: 1
   activation_checkpointing: true
   learning_rate: 0.0003
